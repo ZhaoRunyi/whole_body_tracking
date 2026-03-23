@@ -8,6 +8,8 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import os
+from pathlib import Path
 import sys
 
 from isaaclab.app import AppLauncher
@@ -24,7 +26,19 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
-parser.add_argument("--registry_name", type=str, required=True, help="The name of the wand registry.")
+parser.add_argument(
+    "--registry_name",
+    type=str,
+    nargs="+",
+    default=None,
+    help="One or more wandb motion registries (space-separated).",
+)
+parser.add_argument(
+    "--local_dir",
+    type=str,
+    default=None,
+    help="Recursively read all *.npz motions from local directory.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -46,9 +60,9 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
-import os
 import torch
 from datetime import datetime
+import numpy as np
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -73,6 +87,88 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+REQUIRED_MOTION_KEYS = (
+    "fps",
+    "joint_pos",
+    "joint_vel",
+    "body_pos_w",
+    "body_quat_w",
+    "body_lin_vel_w",
+    "body_ang_vel_w",
+)
+
+
+def _normalize_registry_names(registry_names: list[str]) -> list[str]:
+    out: list[str] = []
+    for name in registry_names:
+        name = name.strip()
+        if not name:
+            continue
+        if ":" not in name:
+            name += ":latest"
+        out.append(name)
+    if not out:
+        raise ValueError("--registry_name is empty.")
+    return out
+
+
+def _iter_motion_npz_files(root: str) -> list[str]:
+    root_path = Path(root).expanduser().resolve()
+    if not root_path.is_dir():
+        raise NotADirectoryError(str(root_path))
+
+    files: list[Path] = []
+    for dirpath, _dirnames, filenames in os.walk(root_path):
+        for filename in filenames:
+            if filename.endswith(".npz"):
+                files.append(Path(dirpath) / filename)
+    files.sort(key=lambda p: str(p))
+    if not files:
+        raise FileNotFoundError(f"No *.npz motion files found under: {root_path}")
+    return [str(path) for path in files]
+
+
+def _validate_motion_npz_file(path: str) -> None:
+    with np.load(path, allow_pickle=False) as data:
+        missing = [k for k in REQUIRED_MOTION_KEYS if k not in data]
+    if missing:
+        raise ValueError(f"Motion file {path} missing keys: {missing}")
+
+
+def _download_motion_npz_list(registry_names: list[str]) -> list[str]:
+    import wandb
+
+    api = wandb.Api()
+    out: list[str] = []
+    for registry_name in registry_names:
+        artifact = api.artifact(registry_name)
+        motion_file = str(Path(artifact.download()) / "motion.npz")
+        if not os.path.isfile(motion_file):
+            raise FileNotFoundError(f"motion.npz not found in artifact dir for {registry_name}")
+        _validate_motion_npz_file(motion_file)
+        out.append(motion_file)
+    return out
+
+
+def _resolve_motion_files() -> tuple[str | list[str], list[str]]:
+    has_registry = bool(args_cli.registry_name)
+    has_local_dir = bool(args_cli.local_dir)
+    if has_registry == has_local_dir:
+        raise ValueError("Provide exactly one of --registry_name or --local_
+dir.")
+
+    if has_local_dir:
+        motion_files = _iter_motion_npz_files(args_cli.local_
+dir)
+        for motion_file in motion_files:
+            _validate_motion_npz_file(motion_file)
+        return (motion_files[0] if len(motion_files) == 1 else motion_files), []
+
+    registry_names = _normalize_registry_names(args_cli.registry_name)
+    motion_files = _download_motion_npz_list(registry_names)
+    return (motion_files[0] if len(motion_files) == 1 else motion_files), registry_names
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
@@ -88,17 +184,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
-    # load the motion file from the wandb registry
-    registry_name = args_cli.registry_name
-    if ":" not in registry_name:  # Check if the registry name includes alias, if not, append ":latest"
-        registry_name += ":latest"
-    import pathlib
-
-    import wandb
-
-    api = wandb.Api()
-    artifact = api.artifact(registry_name)
-    env_cfg.commands.motion.motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
+    # load one or more motion files from wandb registry or local recursive directory
+    motion_file, registry_names = _resolve_motion_files()
+    env_cfg.commands.motion.motion_file = motion_file
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -133,7 +221,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create runner from rsl-rl
     runner = OnPolicyRunner(
-        env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device, registry_name=registry_name
+        env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device, registry_name=registry_names
     )
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
