@@ -62,6 +62,7 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import torch
+import torch.nn.functional as F
 from datetime import datetime
 import numpy as np
 
@@ -97,6 +98,18 @@ REQUIRED_MOTION_KEYS = (
     "body_lin_vel_w",
     "body_ang_vel_w",
 )
+
+
+def _parse_cuda_version(version_str: str | None) -> tuple[int, int] | None:
+    if not version_str:
+        return None
+    parts = version_str.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -181,6 +194,89 @@ def _maybe_sync_cuda(stage: str, device: str | torch.device) -> None:
     device_index = device.index if device.index is not None else torch.cuda.current_device()
     torch.cuda.synchronize(device_index)
     print(f"[INFO] CUDA synchronize passed @ {stage}")
+
+
+def _log_torch_cuda_stack(device: str | torch.device) -> None:
+    device = torch.device(device)
+    print(f"[INFO] Torch stack: torch={torch.__version__}, torch_cuda={torch.version.cuda}")
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    capability = torch.cuda.get_device_capability(device_index)
+    arch_list = []
+    try:
+        arch_list = torch.cuda.get_arch_list()
+    except Exception:
+        pass
+    print(
+        f"[INFO] CUDA device capability: sm_{capability[0]}{capability[1]} "
+        f"on {torch.cuda.get_device_name(device_index)}; "
+        f"torch arch list={arch_list}"
+    )
+
+
+def _log_python_env_stack() -> None:
+    conda_env = os.getenv("CONDA_DEFAULT_ENV")
+    conda_prefix = os.getenv("CONDA_PREFIX")
+    conda_shlvl = os.getenv("CONDA_SHLVL")
+    print(
+        "[INFO] Python env stack: "
+        f"sys.executable={sys.executable}, "
+        f"CONDA_DEFAULT_ENV={conda_env!r}, CONDA_PREFIX={conda_prefix!r}, CONDA_SHLVL={conda_shlvl!r}"
+    )
+    try:
+        shlvl = int(conda_shlvl) if conda_shlvl is not None else 0
+    except ValueError:
+        shlvl = 0
+    if shlvl > 1:
+        print(
+            "[WARN] Detected stacked conda environments (CONDA_SHLVL > 1). "
+            "This can mix shared libraries across envs even when `which python` looks correct."
+        )
+
+
+def _check_blackwell_torch_compatibility(device: str | torch.device) -> None:
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    capability = torch.cuda.get_device_capability(device_index)
+    device_name = torch.cuda.get_device_name(device_index)
+    torch_cuda_version = _parse_cuda_version(torch.version.cuda)
+
+    # NVIDIA documents Blackwell support starting with CUDA 12.8.
+    # Isaac Lab 2.1.0 also recommends cu128 nightly for 50-series GPUs
+    # instead of the default torch 2.5.1/cu121 stack bundled with Isaac Sim.
+    is_probably_blackwell = capability[0] >= 10 or "blackwell" in device_name.lower()
+    if is_probably_blackwell and (torch_cuda_version is None or torch_cuda_version < (12, 8)):
+        raise RuntimeError(
+            "Detected a likely Blackwell GPU "
+            f"({device_name}, sm_{capability[0]}{capability[1]}) with torch CUDA "
+            f"{torch.version.cuda!r}. This stack is likely incompatible. "
+            "Official NVIDIA CUDA docs add Blackwell support in CUDA 12.8, and Isaac Lab 2.1.0 "
+            "explicitly recommends a cu128/nightly PyTorch build for 50-series GPUs instead of "
+            "the default torch 2.5.1/cu121 install. Please upgrade the remote environment to a "
+            "PyTorch build with CUDA 12.8+ (or newer) before debugging this repo further."
+        )
+
+
+def _run_cublas_smoke_test(stage: str, device: str | torch.device, batch_size: int = 4) -> None:
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+
+    x = torch.randn(batch_size, 160, device=device, dtype=torch.float32)
+    weight = torch.randn(512, 160, device=device, dtype=torch.float32)
+    bias = torch.randn(512, device=device, dtype=torch.float32)
+    y = F.linear(x, weight, bias)
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    torch.cuda.synchronize(device_index)
+    print(
+        f"[INFO] cuBLAS smoke test passed @ {stage}: "
+        f"input_shape={tuple(x.shape)}, output_shape={tuple(y.shape)}"
+    )
 
 
 def _log_motion_storage(env: gym.Env, device: str | torch.device) -> None:
@@ -333,6 +429,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    _log_python_env_stack()
+    _log_torch_cuda_stack(env_cfg.sim.device)
+    _check_blackwell_torch_compatibility(env_cfg.sim.device)
+    _run_cublas_smoke_test("before env creation", env_cfg.sim.device)
 
     # load one or more motion files from wandb registry or local recursive directory
     motion_file, registry_names = _resolve_motion_files()
@@ -363,6 +463,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     _maybe_sync_cuda("after env creation", agent_cfg.device)
+    _run_cublas_smoke_test("after env creation", agent_cfg.device)
     _log_motion_storage(env, agent_cfg.device)
     # wrap for video recording
     if args_cli.video:
@@ -388,6 +489,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device, registry_name=registry_names
     )
     _maybe_sync_cuda("after runner init", agent_cfg.device)
+    _run_cublas_smoke_test("after runner init", agent_cfg.device)
     _log_cuda_memory("after runner init", agent_cfg.device)
     _log_system_gpu_memory("after runner init", agent_cfg.device)
     # write git state to logs
@@ -408,6 +510,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # run training
     _maybe_sync_cuda("before learn", agent_cfg.device)
+    _run_cublas_smoke_test("before learn", agent_cfg.device, batch_size=max(1, env.unwrapped.num_envs))
     _log_cuda_memory("before learn", agent_cfg.device)
     _log_system_gpu_memory("before learn", agent_cfg.device)
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
