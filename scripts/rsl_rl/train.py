@@ -279,6 +279,41 @@ def _run_cublas_smoke_test(stage: str, device: str | torch.device, batch_size: i
     )
 
 
+def _extract_privileged_obs(extras: object) -> torch.Tensor | None:
+    if not isinstance(extras, dict):
+        return None
+    observations = extras.get("observations")
+    if not isinstance(observations, dict):
+        return None
+    critic_obs = observations.get("critic")
+    return critic_obs if isinstance(critic_obs, torch.Tensor) else None
+
+
+def _log_tensor_summary(name: str, tensor: torch.Tensor | None) -> None:
+    if tensor is None:
+        print(f"[INFO] Tensor summary: {name}=None")
+        return
+    finite = bool(torch.isfinite(tensor).all().item())
+    print(
+        f"[INFO] Tensor summary: {name}.shape={tuple(tensor.shape)}, "
+        f"{name}.device={tensor.device}, {name}.dtype={tensor.dtype}, finite={finite}"
+    )
+
+
+def _preflight_env_and_policy(env, runner, device: str | torch.device) -> None:
+    print("[INFO] Running env/policy preflight before learn...")
+    obs, extras = env.get_observations()
+    _maybe_sync_cuda("after get_observations preflight", device)
+    privileged_obs = _extract_privileged_obs(extras)
+    _log_tensor_summary("policy_obs", obs)
+    _log_tensor_summary("critic_obs", privileged_obs)
+
+    with torch.no_grad():
+        _ = runner.alg.act(obs, privileged_obs)
+    _maybe_sync_cuda("after policy act preflight", device)
+    print("[INFO] Env/policy preflight passed before learn.")
+
+
 def _log_motion_storage(env: gym.Env, device: str | torch.device) -> None:
     motion_cmd = env.unwrapped.command_manager.get_term("motion")
     library_cpu_bytes = 0
@@ -509,6 +544,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
     # run training
+    _preflight_env_and_policy(env, runner, agent_cfg.device)
     _maybe_sync_cuda("before learn", agent_cfg.device)
     _run_cublas_smoke_test("before learn", agent_cfg.device, batch_size=max(1, env.unwrapped.num_envs))
     _log_cuda_memory("before learn", agent_cfg.device)
