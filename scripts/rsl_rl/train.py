@@ -315,29 +315,42 @@ def _preflight_env_and_policy(env, runner, device: str | torch.device) -> None:
 
 
 def _maybe_run_single_step_preflight(env, runner, device: str | torch.device) -> None:
-    if os.getenv("WBT_STEP_PREFLIGHT") != "1":
+    steps_env = os.getenv("WBT_STEP_PREFLIGHT_STEPS")
+    if steps_env is None:
+        steps = 1 if os.getenv("WBT_STEP_PREFLIGHT") == "1" else 0
+    else:
+        steps = int(steps_env)
+
+    if steps <= 0:
         return
 
-    print("[INFO] Running single-step rollout preflight before learn...")
+    print(f"[INFO] Running rollout preflight before learn for {steps} step(s)...")
     obs, extras = env.get_observations()
     privileged_obs = _extract_privileged_obs(extras)
-    with torch.no_grad():
-        actions = runner.alg.act(obs, privileged_obs)
-    _maybe_sync_cuda("after rollout preflight act", device)
-    _log_tensor_summary("preflight_actions", actions)
+    next_obs = obs
+    next_privileged_obs = privileged_obs
 
-    next_obs, rewards, dones, infos = env.step(actions)
-    _maybe_sync_cuda("after rollout preflight env.step", device)
-    next_privileged_obs = _extract_privileged_obs(infos)
-    _log_tensor_summary("next_policy_obs", next_obs)
-    _log_tensor_summary("next_critic_obs", next_privileged_obs)
-    _log_tensor_summary("rewards", rewards if isinstance(rewards, torch.Tensor) else None)
-    _log_tensor_summary("dones", dones if isinstance(dones, torch.Tensor) else None)
+    for step_idx in range(steps):
+        with torch.no_grad():
+            actions = runner.alg.act(next_obs, next_privileged_obs)
+        _maybe_sync_cuda(f"after rollout preflight act step {step_idx}", device)
+        if step_idx == 0 or step_idx == steps - 1:
+            _log_tensor_summary("preflight_actions", actions)
+
+        next_obs, rewards, dones, infos = env.step(actions)
+        _maybe_sync_cuda(f"after rollout preflight env.step step {step_idx}", device)
+        next_privileged_obs = _extract_privileged_obs(infos)
+
+        if step_idx == 0 or step_idx == steps - 1:
+            _log_tensor_summary("next_policy_obs", next_obs)
+            _log_tensor_summary("next_critic_obs", next_privileged_obs)
+            _log_tensor_summary("rewards", rewards if isinstance(rewards, torch.Tensor) else None)
+            _log_tensor_summary("dones", dones if isinstance(dones, torch.Tensor) else None)
 
     with torch.no_grad():
         _ = runner.alg.act(next_obs, next_privileged_obs)
-    _maybe_sync_cuda("after rollout preflight second act", device)
-    print("[INFO] Single-step rollout preflight passed before learn.")
+    _maybe_sync_cuda("after rollout preflight final act", device)
+    print("[INFO] Rollout preflight passed before learn.")
 
 
 def _log_motion_storage(env: gym.Env, device: str | torch.device) -> None:
