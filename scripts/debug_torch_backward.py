@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -13,6 +14,29 @@ def sync(device: torch.device, stage: str) -> None:
     device_index = device.index if device.index is not None else torch.cuda.current_device()
     torch.cuda.synchronize(device_index)
     print(f"[INFO] CUDA synchronize passed @ {stage}")
+
+
+def print_loaded_cuda_libs() -> None:
+    maps_path = Path("/proc/self/maps")
+    if not maps_path.exists():
+        return
+
+    keywords = ("libcublas", "libcudart", "libcudnn", "libcuda", "libcusparse", "libnvrtc")
+    libs: set[str] = set()
+    for line in maps_path.read_text().splitlines():
+        if not any(keyword in line for keyword in keywords):
+            continue
+        path = line.split()[-1]
+        if "/" in path:
+            libs.add(path)
+
+    if not libs:
+        print("[INFO] Loaded CUDA libs: none found in /proc/self/maps")
+        return
+
+    print("[INFO] Loaded CUDA libs:")
+    for lib in sorted(libs):
+        print(f"[INFO]   {lib}")
 
 
 def run_linear_backward(device: torch.device, batch_size: int, in_dim: int, out_dim: int) -> None:
@@ -61,6 +85,12 @@ def main() -> None:
         f"CONDA_PREFIX={os.getenv('CONDA_PREFIX')!r}, "
         f"CONDA_SHLVL={os.getenv('CONDA_SHLVL')!r}"
     )
+    print(
+        "[INFO] Runtime env: "
+        f"LD_LIBRARY_PATH={os.getenv('LD_LIBRARY_PATH')!r}, "
+        f"CUDA_HOME={os.getenv('CUDA_HOME')!r}, "
+        f"CUDA_PATH={os.getenv('CUDA_PATH')!r}"
+    )
     print(f"[INFO] Torch stack: torch={torch.__version__}, torch_cuda={torch.version.cuda}")
     if device.type == "cuda" and torch.cuda.is_available():
         device_index = device.index if device.index is not None else torch.cuda.current_device()
@@ -75,6 +105,7 @@ def main() -> None:
         f"allow_tf32_matmul={torch.backends.cuda.matmul.allow_tf32}, "
         f"allow_tf32_cudnn={torch.backends.cudnn.allow_tf32}"
     )
+    print_loaded_cuda_libs()
 
     for batch_size in args.batch_sizes:
         run_linear_backward(device, batch_size, 160, 512)
