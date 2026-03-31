@@ -185,6 +185,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # load one or more motion files from wandb registry or local recursive directory
     motion_file, registry_names = _resolve_motion_files()
     env_cfg.commands.motion.motion_file = motion_file
+    if isinstance(motion_file, list):
+        print(f"[INFO] Loaded {len(motion_file)} motion files for training.")
+        if args_cli.num_envs is None:
+            print(
+                "[WARN] --num_envs was not provided, so the task default "
+                f"num_envs={env_cfg.scene.num_envs} will be used. "
+                "Multi-motion training now keeps reference motions on CPU by default, "
+                "but the simulator itself can still exhaust GPU memory on smaller cards. "
+                "If you still see CUDA OOM or CUBLAS initialization failures on the target machine, "
+                "retry with a smaller --num_envs."
+            )
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)

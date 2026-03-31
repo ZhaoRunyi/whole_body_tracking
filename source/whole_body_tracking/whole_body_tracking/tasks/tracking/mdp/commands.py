@@ -30,32 +30,34 @@ if TYPE_CHECKING:
 class MotionLoader:
     def __init__(self, motion_file: str, body_indexes: Sequence[int], device: str = "cpu"):
         assert os.path.isfile(motion_file), f"Invalid file path: {motion_file}"
-        data = np.load(motion_file)
-        self.fps = data["fps"]
-        self.joint_pos = torch.tensor(data["joint_pos"], dtype=torch.float32, device=device)
-        self.joint_vel = torch.tensor(data["joint_vel"], dtype=torch.float32, device=device)
-        self._body_pos_w = torch.tensor(data["body_pos_w"], dtype=torch.float32, device=device)
-        self._body_quat_w = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=device)
-        self._body_lin_vel_w = torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=device)
-        self._body_ang_vel_w = torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=device)
-        self._body_indexes = body_indexes
+        self.device = torch.device(device)
+        body_indexes_np = np.asarray(body_indexes, dtype=np.int64)
+        with np.load(motion_file, allow_pickle=False) as data:
+            self.fps = data["fps"]
+            self.joint_pos = torch.as_tensor(data["joint_pos"], dtype=torch.float32, device=self.device)
+            self.joint_vel = torch.as_tensor(data["joint_vel"], dtype=torch.float32, device=self.device)
+            # Only keep bodies required by the task to avoid wasting memory on unused references.
+            self.body_pos_w = torch.as_tensor(
+                data["body_pos_w"][:, body_indexes_np], dtype=torch.float32, device=self.device
+            )
+            self.body_quat_w = torch.as_tensor(
+                data["body_quat_w"][:, body_indexes_np], dtype=torch.float32, device=self.device
+            )
+            self.body_lin_vel_w = torch.as_tensor(
+                data["body_lin_vel_w"][:, body_indexes_np], dtype=torch.float32, device=self.device
+            )
+            self.body_ang_vel_w = torch.as_tensor(
+                data["body_ang_vel_w"][:, body_indexes_np], dtype=torch.float32, device=self.device
+            )
         self.time_step_total = self.joint_pos.shape[0]
 
-    @property
-    def body_pos_w(self) -> torch.Tensor:
-        return self._body_pos_w[:, self._body_indexes]
-
-    @property
-    def body_quat_w(self) -> torch.Tensor:
-        return self._body_quat_w[:, self._body_indexes]
-
-    @property
-    def body_lin_vel_w(self) -> torch.Tensor:
-        return self._body_lin_vel_w[:, self._body_indexes]
-
-    @property
-    def body_ang_vel_w(self) -> torch.Tensor:
-        return self._body_ang_vel_w[:, self._body_indexes]
+    def sample(self, field_name: str, time_steps: torch.Tensor, device: str | torch.device) -> torch.Tensor:
+        field = getattr(self, field_name)
+        sample = field[time_steps.to(device=field.device, dtype=torch.long)]
+        target_device = torch.device(device)
+        if sample.device != target_device:
+            sample = sample.to(target_device)
+        return sample
 
 
 class MotionCommand(CommandTerm):
@@ -77,7 +79,14 @@ class MotionCommand(CommandTerm):
         if len(motion_files) == 0:
             raise ValueError("motion_file cannot be empty.")
 
-        self.motions = [MotionLoader(path, self.body_indexes, device=self.device) for path in motion_files]
+        motion_storage_device = self.cfg.motion_storage_device
+        if motion_storage_device is None:
+            motion_storage_device = "cpu" if len(motion_files) > 1 else self.device
+
+        self.motions = [
+            MotionLoader(path, self.body_indexes.detach().cpu().tolist(), device=motion_storage_device)
+            for path in motion_files
+        ]
         # Keep compatibility for legacy code paths (e.g. exporter).
         self.motion = self.motions[0]
         self.num_motions = len(self.motions)
@@ -97,9 +106,32 @@ class MotionCommand(CommandTerm):
             )
 
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._joint_pos = torch.empty(
+            (self.num_envs, *self.motion.joint_pos.shape[1:]), dtype=self.motion.joint_pos.dtype, device=self.device
+        )
+        self._joint_vel = torch.empty(
+            (self.num_envs, *self.motion.joint_vel.shape[1:]), dtype=self.motion.joint_vel.dtype, device=self.device
+        )
+        self._body_pos_w = torch.empty(
+            (self.num_envs, *self.motion.body_pos_w.shape[1:]), dtype=self.motion.body_pos_w.dtype, device=self.device
+        )
+        self._body_quat_w = torch.empty(
+            (self.num_envs, *self.motion.body_quat_w.shape[1:]), dtype=self.motion.body_quat_w.dtype, device=self.device
+        )
+        self._body_lin_vel_w = torch.empty(
+            (self.num_envs, *self.motion.body_lin_vel_w.shape[1:]),
+            dtype=self.motion.body_lin_vel_w.dtype,
+            device=self.device,
+        )
+        self._body_ang_vel_w = torch.empty(
+            (self.num_envs, *self.motion.body_ang_vel_w.shape[1:]),
+            dtype=self.motion.body_ang_vel_w.dtype,
+            device=self.device,
+        )
         self.body_pos_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 3, device=self.device)
         self.body_quat_relative_w = torch.zeros(self.num_envs, len(cfg.body_names), 4, device=self.device)
         self.body_quat_relative_w[:, :, 0] = 1.0
+        self._refresh_motion_buffers()
 
         self.bin_count = int(self.motion.time_step_total // (1 / (env.cfg.decimation * env.cfg.sim.dt))) + 1
         self.bin_failed_count = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
@@ -125,40 +157,49 @@ class MotionCommand(CommandTerm):
     def command(self) -> torch.Tensor:  # TODO Consider again if this is the best observation
         return torch.cat([self.joint_pos, self.joint_vel], dim=1)
 
-    def _gather_motion_field(self, field_name: str) -> torch.Tensor:
-        sample = getattr(self.motions[0], field_name)
-        out = torch.empty((self.num_envs, *sample.shape[1:]), dtype=sample.dtype, device=self.device)
+    def _refresh_motion_buffers(self, env_ids: Sequence[int] | None = None) -> None:
+        if env_ids is None:
+            env_ids_tensor = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        else:
+            env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+            if env_ids_tensor.numel() == 0:
+                return
+
         for motion_id, motion in enumerate(self.motions):
-            env_ids = torch.where(self.motion_ids == motion_id)[0]
-            if len(env_ids) == 0:
+            motion_env_ids = env_ids_tensor[self.motion_ids[env_ids_tensor] == motion_id]
+            if motion_env_ids.numel() == 0:
                 continue
-            t = torch.clamp(self.time_steps[env_ids], max=motion.time_step_total - 1)
-            out[env_ids] = getattr(motion, field_name)[t]
-        return out
+            time_steps = torch.clamp(self.time_steps[motion_env_ids], max=motion.time_step_total - 1)
+            self._joint_pos[motion_env_ids] = motion.sample("joint_pos", time_steps, self.device)
+            self._joint_vel[motion_env_ids] = motion.sample("joint_vel", time_steps, self.device)
+            self._body_pos_w[motion_env_ids] = motion.sample("body_pos_w", time_steps, self.device)
+            self._body_quat_w[motion_env_ids] = motion.sample("body_quat_w", time_steps, self.device)
+            self._body_lin_vel_w[motion_env_ids] = motion.sample("body_lin_vel_w", time_steps, self.device)
+            self._body_ang_vel_w[motion_env_ids] = motion.sample("body_ang_vel_w", time_steps, self.device)
 
     @property
     def joint_pos(self) -> torch.Tensor:
-        return self._gather_motion_field("joint_pos")
+        return self._joint_pos
 
     @property
     def joint_vel(self) -> torch.Tensor:
-        return self._gather_motion_field("joint_vel")
+        return self._joint_vel
 
     @property
     def body_pos_w(self) -> torch.Tensor:
-        return self._gather_motion_field("body_pos_w") + self._env.scene.env_origins[:, None, :]
+        return self._body_pos_w + self._env.scene.env_origins[:, None, :]
 
     @property
     def body_quat_w(self) -> torch.Tensor:
-        return self._gather_motion_field("body_quat_w")
+        return self._body_quat_w
 
     @property
     def body_lin_vel_w(self) -> torch.Tensor:
-        return self._gather_motion_field("body_lin_vel_w")
+        return self._body_lin_vel_w
 
     @property
     def body_ang_vel_w(self) -> torch.Tensor:
-        return self._gather_motion_field("body_ang_vel_w")
+        return self._body_ang_vel_w
 
     @property
     def anchor_pos_w(self) -> torch.Tensor:
@@ -294,6 +335,7 @@ class MotionCommand(CommandTerm):
         if self.cfg.lock_motion_per_episode or self.num_motions == 1:
             self.motion_ids[env_ids] = torch.multinomial(self.motion_prob, len(env_ids), replacement=True)
         self._adaptive_sampling(env_ids)
+        self._refresh_motion_buffers(env_ids)
 
         root_pos = self.body_pos_w[:, 0].clone()
         root_ori = self.body_quat_w[:, 0].clone()
@@ -330,6 +372,7 @@ class MotionCommand(CommandTerm):
         self.time_steps += 1
         env_ids = torch.where(self.time_steps >= self.motion_lengths[self.motion_ids])[0]
         self._resample_command(env_ids)
+        self._refresh_motion_buffers()
 
         anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
         anchor_quat_w_repeat = self.anchor_quat_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
@@ -415,6 +458,7 @@ class MotionCommandCfg(CommandTermCfg):
     motion_sampling: str = "uniform"
     motion_weights: list[float] | None = None
     lock_motion_per_episode: bool = True
+    motion_storage_device: str | None = None
 
     joint_position_range: tuple[float, float] = (-0.52, 0.52)
 
