@@ -10,6 +10,7 @@
 import argparse
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 from isaaclab.app import AppLauncher
@@ -125,6 +126,50 @@ def _log_cuda_memory(stage: str, device: str | torch.device) -> None:
     )
 
 
+def _log_system_gpu_memory(stage: str, device: str | torch.device) -> None:
+    device = torch.device(device)
+    if device.type != "cuda":
+        return
+
+    device_index = device.index if device.index is not None else 0
+
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        print(
+            f"[INFO] System GPU memory @ {stage}: "
+            f"used={_format_gib(mem.used)}, free={_format_gib(mem.free)}, total={_format_gib(mem.total)}"
+        )
+        return
+    except Exception:
+        pass
+
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--id={device_index}",
+                "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        used_mib, total_mib = [part.strip() for part in result.stdout.strip().split(",", maxsplit=1)]
+        used_bytes = int(used_mib) * 1024 * 1024
+        total_bytes = int(total_mib) * 1024 * 1024
+        print(
+            f"[INFO] System GPU memory @ {stage}: "
+            f"used={_format_gib(used_bytes)}, total={_format_gib(total_bytes)}"
+        )
+    except Exception:
+        pass
+
+
 def _maybe_sync_cuda(stage: str, device: str | torch.device) -> None:
     if os.getenv("WBT_SYNC_CUDA_DEBUG") != "1":
         return
@@ -181,6 +226,28 @@ def _log_motion_storage(env: gym.Env, device: str | torch.device) -> None:
     )
 
     _log_cuda_memory("after motion storage inspection", device)
+    _log_system_gpu_memory("after motion storage inspection", device)
+
+
+def _disable_training_debug_vis(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg) -> None:
+    if os.getenv("WBT_ENABLE_TRAIN_DEBUG_VIS") == "1":
+        print("[INFO] Keeping training debug visualization enabled because WBT_ENABLE_TRAIN_DEBUG_VIS=1.")
+        return
+
+    disabled: list[str] = []
+
+    motion_cfg = getattr(getattr(env_cfg, "commands", None), "motion", None)
+    if motion_cfg is not None and getattr(motion_cfg, "debug_vis", False):
+        motion_cfg.debug_vis = False
+        disabled.append("commands.motion.debug_vis")
+
+    contact_sensor_cfg = getattr(getattr(env_cfg, "scene", None), "contact_forces", None)
+    if contact_sensor_cfg is not None and getattr(contact_sensor_cfg, "debug_vis", False):
+        contact_sensor_cfg.debug_vis = False
+        disabled.append("scene.contact_forces.debug_vis")
+
+    if disabled:
+        print(f"[INFO] Disabled training debug visualization: {', '.join(disabled)}")
 
 
 def _normalize_registry_names(registry_names: list[str]) -> list[str]:
@@ -270,6 +337,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # load one or more motion files from wandb registry or local recursive directory
     motion_file, registry_names = _resolve_motion_files()
     env_cfg.commands.motion.motion_file = motion_file
+    _disable_training_debug_vis(env_cfg)
     if isinstance(motion_file, list):
         print(f"[INFO] Loaded {len(motion_file)} motion files for training.")
         if args_cli.num_envs is None:
@@ -321,6 +389,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     )
     _maybe_sync_cuda("after runner init", agent_cfg.device)
     _log_cuda_memory("after runner init", agent_cfg.device)
+    _log_system_gpu_memory("after runner init", agent_cfg.device)
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # save resume path before creating a new log_dir
@@ -340,6 +409,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # run training
     _maybe_sync_cuda("before learn", agent_cfg.device)
     _log_cuda_memory("before learn", agent_cfg.device)
+    _log_system_gpu_memory("before learn", agent_cfg.device)
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 
     # close the simulator
