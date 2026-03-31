@@ -314,6 +314,32 @@ def _preflight_env_and_policy(env, runner, device: str | torch.device) -> None:
     print("[INFO] Env/policy preflight passed before learn.")
 
 
+def _maybe_run_single_step_preflight(env, runner, device: str | torch.device) -> None:
+    if os.getenv("WBT_STEP_PREFLIGHT") != "1":
+        return
+
+    print("[INFO] Running single-step rollout preflight before learn...")
+    obs, extras = env.get_observations()
+    privileged_obs = _extract_privileged_obs(extras)
+    with torch.no_grad():
+        actions = runner.alg.act(obs, privileged_obs)
+    _maybe_sync_cuda("after rollout preflight act", device)
+    _log_tensor_summary("preflight_actions", actions)
+
+    next_obs, rewards, dones, infos = env.step(actions)
+    _maybe_sync_cuda("after rollout preflight env.step", device)
+    next_privileged_obs = _extract_privileged_obs(infos)
+    _log_tensor_summary("next_policy_obs", next_obs)
+    _log_tensor_summary("next_critic_obs", next_privileged_obs)
+    _log_tensor_summary("rewards", rewards if isinstance(rewards, torch.Tensor) else None)
+    _log_tensor_summary("dones", dones if isinstance(dones, torch.Tensor) else None)
+
+    with torch.no_grad():
+        _ = runner.alg.act(next_obs, next_privileged_obs)
+    _maybe_sync_cuda("after rollout preflight second act", device)
+    print("[INFO] Single-step rollout preflight passed before learn.")
+
+
 def _log_motion_storage(env: gym.Env, device: str | torch.device) -> None:
     motion_cmd = env.unwrapped.command_manager.get_term("motion")
     library_cpu_bytes = 0
@@ -545,6 +571,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # run training
     _preflight_env_and_policy(env, runner, agent_cfg.device)
+    _maybe_run_single_step_preflight(env, runner, agent_cfg.device)
     _maybe_sync_cuda("before learn", agent_cfg.device)
     _run_cublas_smoke_test("before learn", agent_cfg.device, batch_size=max(1, env.unwrapped.num_envs))
     _log_cuda_memory("before learn", agent_cfg.device)

@@ -20,13 +20,13 @@ def robot_anchor_ori_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
 def robot_anchor_lin_vel_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
 
-    return command.robot_anchor_vel_w[:, :3].view(env.num_envs, -1)
+    return command.robot_anchor_lin_vel_w.view(env.num_envs, -1)
 
 
 def robot_anchor_ang_vel_w(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
     command: MotionCommand = env.command_manager.get_term(command_name)
 
-    return command.robot_anchor_vel_w[:, 3:6].view(env.num_envs, -1)
+    return command.robot_anchor_ang_vel_w.view(env.num_envs, -1)
 
 
 def robot_body_pos_b(env: ManagerBasedEnv, command_name: str) -> torch.Tensor:
