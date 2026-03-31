@@ -98,6 +98,91 @@ REQUIRED_MOTION_KEYS = (
 )
 
 
+def _tensor_nbytes(tensor: torch.Tensor) -> int:
+    return tensor.numel() * tensor.element_size()
+
+
+def _format_gib(num_bytes: int) -> str:
+    return f"{num_bytes / (1024**3):.2f} GiB"
+
+
+def _log_cuda_memory(stage: str, device: str | torch.device) -> None:
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device_index)
+    allocated = torch.cuda.memory_allocated(device_index)
+    reserved = torch.cuda.memory_reserved(device_index)
+    max_allocated = torch.cuda.max_memory_allocated(device_index)
+    max_reserved = torch.cuda.max_memory_reserved(device_index)
+    print(
+        f"[INFO] CUDA memory @ {stage}: "
+        f"allocated={_format_gib(allocated)}, reserved={_format_gib(reserved)}, "
+        f"max_allocated={_format_gib(max_allocated)}, max_reserved={_format_gib(max_reserved)}, "
+        f"total={_format_gib(props.total_memory)} on {props.name}"
+    )
+
+
+def _maybe_sync_cuda(stage: str, device: str | torch.device) -> None:
+    if os.getenv("WBT_SYNC_CUDA_DEBUG") != "1":
+        return
+
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    torch.cuda.synchronize(device_index)
+    print(f"[INFO] CUDA synchronize passed @ {stage}")
+
+
+def _log_motion_storage(env: gym.Env, device: str | torch.device) -> None:
+    motion_cmd = env.unwrapped.command_manager.get_term("motion")
+    library_cpu_bytes = 0
+    library_gpu_bytes = 0
+    library_devices: set[str] = set()
+    motion_tensor_names = (
+        "joint_pos",
+        "joint_vel",
+        "body_pos_w",
+        "body_quat_w",
+        "body_lin_vel_w",
+        "body_ang_vel_w",
+    )
+    active_buffer_names = (
+        "_joint_pos",
+        "_joint_vel",
+        "_body_pos_w",
+        "_body_quat_w",
+        "_body_lin_vel_w",
+        "_body_ang_vel_w",
+    )
+
+    for motion in motion_cmd.motions:
+        for name in motion_tensor_names:
+            tensor = getattr(motion, name)
+            nbytes = _tensor_nbytes(tensor)
+            library_devices.add(str(tensor.device))
+            if tensor.device.type == "cuda":
+                library_gpu_bytes += nbytes
+            else:
+                library_cpu_bytes += nbytes
+
+    active_gpu_bytes = sum(_tensor_nbytes(getattr(motion_cmd, name)) for name in active_buffer_names)
+    print(
+        "[INFO] Motion storage: "
+        f"num_motions={motion_cmd.num_motions}, "
+        f"library_devices={sorted(library_devices)}, "
+        f"library_cpu={_format_gib(library_cpu_bytes)}, "
+        f"library_gpu={_format_gib(library_gpu_bytes)}, "
+        f"active_gpu_buffers={_format_gib(active_gpu_bytes)}"
+    )
+
+    _log_cuda_memory("after motion storage inspection", device)
+
+
 def _normalize_registry_names(registry_names: list[str]) -> list[str]:
     out: list[str] = []
     for name in registry_names:
@@ -209,6 +294,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    _maybe_sync_cuda("after env creation", agent_cfg.device)
+    _log_motion_storage(env, agent_cfg.device)
     # wrap for video recording
     if args_cli.video:
         video_kwargs = {
@@ -232,6 +319,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner = OnPolicyRunner(
         env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device, registry_name=registry_names
     )
+    _maybe_sync_cuda("after runner init", agent_cfg.device)
+    _log_cuda_memory("after runner init", agent_cfg.device)
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # save resume path before creating a new log_dir
@@ -249,6 +338,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
     # run training
+    _maybe_sync_cuda("before learn", agent_cfg.device)
+    _log_cuda_memory("before learn", agent_cfg.device)
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 
     # close the simulator
