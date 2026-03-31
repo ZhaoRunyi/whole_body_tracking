@@ -154,12 +154,10 @@ def _resolve_motion_files() -> tuple[str | list[str], list[str]]:
     has_registry = bool(args_cli.registry_name)
     has_local_dir = bool(args_cli.local_dir)
     if has_registry == has_local_dir:
-        raise ValueError("Provide exactly one of --registry_name or --local_
-dir.")
+        raise ValueError("Provide exactly one of --registry_name or --local_dir.")
 
     if has_local_dir:
-        motion_files = _iter_motion_npz_files(args_cli.local_
-dir)
+        motion_files = _iter_motion_npz_files(args_cli.local_dir)
         for motion_file in motion_files:
             _validate_motion_npz_file(motion_file)
         return (motion_files[0] if len(motion_files) == 1 else motion_files), []
