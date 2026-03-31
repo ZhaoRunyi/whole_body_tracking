@@ -353,6 +353,46 @@ def _maybe_run_single_step_preflight(env, runner, device: str | torch.device) ->
     print("[INFO] Rollout preflight passed before learn.")
 
 
+def _maybe_run_backward_preflight(env, runner, device: str | torch.device) -> None:
+    if os.getenv("WBT_BACKWARD_PREFLIGHT") != "1":
+        return
+
+    print("[INFO] Running backward preflight before learn...")
+    obs, extras = env.get_observations()
+    privileged_obs = _extract_privileged_obs(extras)
+    policy = getattr(runner.alg, "policy", None)
+    if policy is None:
+        raise RuntimeError("Backward preflight expected runner.alg.policy but it was not found.")
+    if not hasattr(policy, "actor") or not hasattr(policy, "critic"):
+        raise RuntimeError("Backward preflight expected policy.actor and policy.critic modules.")
+
+    optimizer = getattr(runner.alg, "optimizer", None)
+    batch_sizes = [1, 6, 24]
+    if hasattr(env.unwrapped, "num_envs"):
+        batch_sizes.append(int(env.unwrapped.num_envs))
+    batch_sizes = sorted({batch_size for batch_size in batch_sizes if batch_size > 0})
+
+    critic_obs = privileged_obs if privileged_obs is not None else obs
+    for batch_size in batch_sizes:
+        actor_batch = obs.repeat(batch_size, 1)
+        critic_batch = critic_obs.repeat(batch_size, 1)
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+
+        actor_out = policy.actor(actor_batch)
+        critic_out = policy.critic(critic_batch)
+        loss = actor_out.float().square().mean() + critic_out.float().square().mean()
+        loss.backward()
+        _maybe_sync_cuda(f"after backward preflight batch_size {batch_size}", device)
+        print(
+            f"[INFO] Backward preflight passed: batch_size={batch_size}, "
+            f"actor_out_shape={tuple(actor_out.shape)}, critic_out_shape={tuple(critic_out.shape)}"
+        )
+
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+
+
 def _log_motion_storage(env: gym.Env, device: str | torch.device) -> None:
     motion_cmd = env.unwrapped.command_manager.get_term("motion")
     library_cpu_bytes = 0
@@ -585,6 +625,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # run training
     _preflight_env_and_policy(env, runner, agent_cfg.device)
     _maybe_run_single_step_preflight(env, runner, agent_cfg.device)
+    _maybe_run_backward_preflight(env, runner, agent_cfg.device)
     _maybe_sync_cuda("before learn", agent_cfg.device)
     _run_cublas_smoke_test("before learn", agent_cfg.device, batch_size=max(1, env.unwrapped.num_envs))
     _log_cuda_memory("before learn", agent_cfg.device)
