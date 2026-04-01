@@ -78,6 +78,7 @@ class MotionCommand(CommandTerm):
             motion_files = [motion_files]
         if len(motion_files) == 0:
             raise ValueError("motion_file cannot be empty.")
+        self.motion_files = [os.path.abspath(path) for path in motion_files]
 
         motion_storage_device = self.cfg.motion_storage_device
         if motion_storage_device is None:
@@ -85,7 +86,7 @@ class MotionCommand(CommandTerm):
 
         self.motions = [
             MotionLoader(path, self.body_indexes.detach().cpu().tolist(), device=motion_storage_device)
-            for path in motion_files
+            for path in self.motion_files
         ]
         # Keep compatibility for legacy code paths (e.g. exporter).
         self.motion = self.motions[0]

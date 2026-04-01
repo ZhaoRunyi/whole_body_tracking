@@ -27,6 +27,20 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--render_refpose",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Render motion reference poses during training when not running headless.",
+)
+parser.add_argument(
+    "--print_refpose",
+    type=int,
+    nargs="?",
+    const=8,
+    default=0,
+    help="Print a snapshot of the current reference motion source for the first N environments. Disabled by default.",
+)
+parser.add_argument(
     "--registry_name",
     type=str,
     nargs="+",
@@ -98,14 +112,40 @@ REQUIRED_MOTION_KEYS = (
 )
 
 
-def _disable_training_debug_vis(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg) -> None:
+def _configure_training_visualization(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, render_refpose: bool
+) -> None:
     motion_cfg = getattr(getattr(env_cfg, "commands", None), "motion", None)
     if motion_cfg is not None:
-        motion_cfg.debug_vis = False
+        motion_cfg.debug_vis = render_refpose and not bool(getattr(args_cli, "headless", False))
 
     contact_sensor_cfg = getattr(getattr(env_cfg, "scene", None), "contact_forces", None)
     if contact_sensor_cfg is not None:
         contact_sensor_cfg.debug_vis = False
+
+
+def _maybe_print_refpose_snapshot(env: gym.Env, num_envs_to_print: int) -> None:
+    if num_envs_to_print <= 0:
+        return
+
+    motion_cmd = env.unwrapped.command_manager.get_term("motion")
+    max_envs = min(num_envs_to_print, motion_cmd.num_envs)
+    if max_envs <= 0:
+        return
+
+    print(f"[INFO] Available reference motions ({motion_cmd.num_motions} total):")
+    for motion_id, motion_source in enumerate(motion_cmd.motion_files):
+        print(f"[INFO]   motion[{motion_id}] file={motion_source}")
+
+    print(f"[INFO] Current reference motion snapshot for first {max_envs}/{motion_cmd.num_envs} envs:")
+    for env_id in range(max_envs):
+        motion_id = int(motion_cmd.motion_ids[env_id].item())
+        time_step = int(motion_cmd.time_steps[env_id].item())
+        motion_source = motion_cmd.motion_files[motion_id]
+        print(f"[INFO]   env[{env_id}] -> motion[{motion_id}] step={time_step} file={motion_source}")
+
+    if not motion_cmd.cfg.lock_motion_per_episode:
+        print("[INFO] Reference motion snapshot is not sticky because lock_motion_per_episode=False.")
 
 
 def _normalize_registry_names(registry_names: list[str]) -> list[str]:
@@ -194,7 +234,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # load one or more motion files from wandb registry or local recursive directory
     motion_file, registry_names = _resolve_motion_files()
     env_cfg.commands.motion.motion_file = motion_file
-    _disable_training_debug_vis(env_cfg)
+    _configure_training_visualization(env_cfg, args_cli.render_refpose)
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -223,6 +263,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
+
+    _maybe_print_refpose_snapshot(env, args_cli.print_refpose)
 
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env)
