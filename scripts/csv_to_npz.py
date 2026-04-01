@@ -2,21 +2,29 @@
 
 .. code-block:: bash
 
-    # Usage
+    # Single-file usage
     python csv_to_npz.py --input_file LAFAN/dance1_subject2.csv --input_fps 30 --frame_range 122 722 \
-    --output_file ./motions/dance1_subject2.npz --output_fps 50
+    --output_name dance1_subject2 --output_fps 50
+
+    # Batch usage
+    python csv_to_npz.py --input_dir LAFAN --target_dir ./motions --input_fps 30 --output_fps 50
 """
 
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+from pathlib import Path
+import tempfile
+
 import numpy as np
 
 from isaaclab.app import AppLauncher
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Replay motion from csv file and output to npz file.")
-parser.add_argument("--input_file", type=str, required=True, help="The path to the input motion csv file.")
+input_group = parser.add_mutually_exclusive_group(required=True)
+input_group.add_argument("--input_file", type=str, help="The path to a single input motion csv file.")
+input_group.add_argument("--input_dir", type=str, help="A directory to recursively search for input motion csv files.")
 parser.add_argument("--input_fps", type=int, default=30, help="The fps of the input motion.")
 parser.add_argument(
     "--frame_range",
@@ -28,7 +36,13 @@ parser.add_argument(
         " loaded."
     ),
 )
-parser.add_argument("--output_name", type=str, required=True, help="The name of the motion npz file.")
+parser.add_argument("--output_name", type=str, default=None, help="Output name for single-file wandb/local export.")
+parser.add_argument(
+    "--target_dir",
+    type=str,
+    default=None,
+    help="Directory to save generated npz files. Required for --input_dir. In batch mode, relative subdirectories are preserved.",
+)
 parser.add_argument("--output_fps", type=int, default=50, help="The fps of the output motion.")
 
 # append AppLauncher cli args
@@ -76,6 +90,118 @@ class ReplayMotionsSceneCfg(InteractiveSceneCfg):
 
     # articulation
     robot: ArticulationCfg = G1_CYLINDER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+
+JOINT_NAMES = [
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+]
+
+
+def _resolve_jobs() -> list[tuple[Path, Path | None, str]]:
+    if args_cli.input_dir is not None:
+        if args_cli.target_dir is None:
+            raise ValueError("--target_dir is required when using --input_dir.")
+        if args_cli.output_name is not None:
+            raise ValueError("--output_name is only valid with --input_file.")
+
+        input_root = Path(args_cli.input_dir).expanduser().resolve()
+        if not input_root.is_dir():
+            raise NotADirectoryError(str(input_root))
+
+        csv_files = sorted(path for path in input_root.rglob("*") if path.is_file() and path.suffix.lower() == ".csv")
+        if not csv_files:
+            raise FileNotFoundError(f"No *.csv files found under: {input_root}")
+
+        target_root = Path(args_cli.target_dir).expanduser().resolve()
+        if target_root.exists() and not target_root.is_dir():
+            raise NotADirectoryError(str(target_root))
+        jobs: list[tuple[Path, Path | None, str]] = []
+        for csv_file in csv_files:
+            relative_output = csv_file.relative_to(input_root).with_suffix(".npz")
+            jobs.append((csv_file, target_root / relative_output, csv_file.stem))
+        return jobs
+
+    input_file = Path(args_cli.input_file).expanduser().resolve()
+    if not input_file.is_file():
+        raise FileNotFoundError(str(input_file))
+
+    output_name = args_cli.output_name if args_cli.output_name is not None else input_file.stem
+    if args_cli.target_dir is None:
+        return [(input_file, None, output_name)]
+
+    target_root = Path(args_cli.target_dir).expanduser().resolve()
+    if target_root.exists() and not target_root.is_dir():
+        raise NotADirectoryError(str(target_root))
+    return [(input_file, target_root / f"{output_name}.npz", output_name)]
+
+
+def _stack_log(log: dict[str, list[np.ndarray] | list[int]]) -> dict[str, np.ndarray | list[int]]:
+    stacked = dict(log)
+    for key in (
+        "joint_pos",
+        "joint_vel",
+        "body_pos_w",
+        "body_quat_w",
+        "body_lin_vel_w",
+        "body_ang_vel_w",
+    ):
+        stacked[key] = np.stack(stacked[key], axis=0)
+    return stacked
+
+
+def _save_npz(log: dict[str, np.ndarray | list[int]], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(output_path, **log)
+    print(f"[INFO]: Motion saved to {output_path}")
+
+
+def _upload_npz_to_wandb(log: dict[str, np.ndarray | list[int]], output_name: str) -> None:
+    with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as tmp_file:
+        tmp_path = Path(tmp_file.name)
+    try:
+        np.savez(tmp_path, **log)
+
+        import wandb
+
+        run = wandb.init(project="csv_to_npz", name=output_name)
+        try:
+            print(f"[INFO]: Logging motion to wandb: {output_name}")
+            registry = "motions"
+            logged_artifact = run.log_artifact(artifact_or_path=str(tmp_path), name=output_name, type=registry)
+            run.link_artifact(artifact=logged_artifact, target_path=f"wandb-registry-{registry}/{output_name}")
+            print(f"[INFO]: Motion saved to wandb registry: {registry}/{output_name}")
+        finally:
+            run.finish()
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 class MotionLoader:
@@ -215,15 +341,22 @@ class MotionLoader:
         return state, reset_flag
 
 
-def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joint_names: list[str]):
-    """Runs the simulation loop."""
-    # Load motion
+def run_simulator(
+    sim: sim_utils.SimulationContext,
+    scene: InteractiveScene,
+    joint_names: list[str],
+    motion_file: str,
+    input_fps: int,
+    output_fps: int,
+    frame_range: tuple[int, int] | None,
+) -> dict[str, np.ndarray | list[int]]:
+    """Run the simulator for a single motion and return the exported npz payload."""
     motion = MotionLoader(
-        motion_file=args_cli.input_file,
-        input_fps=args_cli.input_fps,
-        output_fps=args_cli.output_fps,
+        motion_file=motion_file,
+        input_fps=input_fps,
+        output_fps=output_fps,
         device=sim.device,
-        frame_range=args_cli.frame_range,
+        frame_range=frame_range,
     )
 
     # Extract scene entities
@@ -232,7 +365,7 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
 
     # ------- data logger -------------------------------------------------------
     log = {
-        "fps": [args_cli.output_fps],
+        "fps": [output_fps],
         "joint_pos": [],
         "joint_vel": [],
         "body_pos_w": [],
@@ -240,7 +373,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
         "body_lin_vel_w": [],
         "body_ang_vel_w": [],
     }
-    file_saved = False
     # --------------------------------------------------------------------------
 
     # Simulation loop
@@ -278,41 +410,22 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
         pos_lookat = root_states[0, :3].cpu().numpy()
         sim.set_camera_view(pos_lookat + np.array([2.0, 2.0, 0.5]), pos_lookat)
 
-        if not file_saved:
-            log["joint_pos"].append(robot.data.joint_pos[0, :].cpu().numpy().copy())
-            log["joint_vel"].append(robot.data.joint_vel[0, :].cpu().numpy().copy())
-            log["body_pos_w"].append(robot.data.body_pos_w[0, :].cpu().numpy().copy())
-            log["body_quat_w"].append(robot.data.body_quat_w[0, :].cpu().numpy().copy())
-            log["body_lin_vel_w"].append(robot.data.body_lin_vel_w[0, :].cpu().numpy().copy())
-            log["body_ang_vel_w"].append(robot.data.body_ang_vel_w[0, :].cpu().numpy().copy())
+        log["joint_pos"].append(robot.data.joint_pos[0, :].cpu().numpy().copy())
+        log["joint_vel"].append(robot.data.joint_vel[0, :].cpu().numpy().copy())
+        log["body_pos_w"].append(robot.data.body_pos_w[0, :].cpu().numpy().copy())
+        log["body_quat_w"].append(robot.data.body_quat_w[0, :].cpu().numpy().copy())
+        log["body_lin_vel_w"].append(robot.data.body_lin_vel_w[0, :].cpu().numpy().copy())
+        log["body_ang_vel_w"].append(robot.data.body_ang_vel_w[0, :].cpu().numpy().copy())
 
-        if reset_flag and not file_saved:
-            file_saved = True
-            for k in (
-                "joint_pos",
-                "joint_vel",
-                "body_pos_w",
-                "body_quat_w",
-                "body_lin_vel_w",
-                "body_ang_vel_w",
-            ):
-                log[k] = np.stack(log[k], axis=0)
+        if reset_flag:
+            return _stack_log(log)
 
-            np.savez("/tmp/motion.npz", **log)
-
-            import wandb
-
-            COLLECTION = args_cli.output_name
-            run = wandb.init(project="csv_to_npz", name=COLLECTION)
-            print(f"[INFO]: Logging motion to wandb: {COLLECTION}")
-            REGISTRY = "motions"
-            logged_artifact = run.log_artifact(artifact_or_path="/tmp/motion.npz", name=COLLECTION, type=REGISTRY)
-            run.link_artifact(artifact=logged_artifact, target_path=f"wandb-registry-{REGISTRY}/{COLLECTION}")
-            print(f"[INFO]: Motion saved to wandb registry: {REGISTRY}/{COLLECTION}")
+    raise RuntimeError("Simulation app stopped before motion export completed.")
 
 
 def main():
     """Main function."""
+    jobs = _resolve_jobs()
     # Load kit helper
     sim_cfg = sim_utils.SimulationCfg(device=args_cli.device)
     sim_cfg.dt = 1.0 / args_cli.output_fps
@@ -324,42 +437,22 @@ def main():
     sim.reset()
     # Now we are ready!
     print("[INFO]: Setup complete...")
-    # Run the simulator
-    run_simulator(
-        sim,
-        scene,
-        joint_names=[
-            "left_hip_pitch_joint",
-            "left_hip_roll_joint",
-            "left_hip_yaw_joint",
-            "left_knee_joint",
-            "left_ankle_pitch_joint",
-            "left_ankle_roll_joint",
-            "right_hip_pitch_joint",
-            "right_hip_roll_joint",
-            "right_hip_yaw_joint",
-            "right_knee_joint",
-            "right_ankle_pitch_joint",
-            "right_ankle_roll_joint",
-            "waist_yaw_joint",
-            "waist_roll_joint",
-            "waist_pitch_joint",
-            "left_shoulder_pitch_joint",
-            "left_shoulder_roll_joint",
-            "left_shoulder_yaw_joint",
-            "left_elbow_joint",
-            "left_wrist_roll_joint",
-            "left_wrist_pitch_joint",
-            "left_wrist_yaw_joint",
-            "right_shoulder_pitch_joint",
-            "right_shoulder_roll_joint",
-            "right_shoulder_yaw_joint",
-            "right_elbow_joint",
-            "right_wrist_roll_joint",
-            "right_wrist_pitch_joint",
-            "right_wrist_yaw_joint",
-        ],
-    )
+    print(f"[INFO]: Preparing to convert {len(jobs)} motion file(s).")
+    for input_path, output_path, output_name in jobs:
+        print(f"[INFO]: Converting {input_path}")
+        log = run_simulator(
+            sim,
+            scene,
+            joint_names=JOINT_NAMES,
+            motion_file=str(input_path),
+            input_fps=args_cli.input_fps,
+            output_fps=args_cli.output_fps,
+            frame_range=args_cli.frame_range,
+        )
+        if output_path is None:
+            _upload_npz_to_wandb(log, output_name)
+        else:
+            _save_npz(log, output_path)
 
 
 if __name__ == "__main__":

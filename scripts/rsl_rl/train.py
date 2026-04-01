@@ -10,7 +10,6 @@
 import argparse
 import os
 from pathlib import Path
-import subprocess
 import sys
 
 from isaaclab.app import AppLauncher
@@ -62,7 +61,6 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import torch
-import torch.nn.functional as F
 from datetime import datetime
 import numpy as np
 
@@ -100,364 +98,14 @@ REQUIRED_MOTION_KEYS = (
 )
 
 
-def _parse_cuda_version(version_str: str | None) -> tuple[int, int] | None:
-    if not version_str:
-        return None
-    parts = version_str.split(".")
-    if len(parts) < 2:
-        return None
-    try:
-        return int(parts[0]), int(parts[1])
-    except ValueError:
-        return None
-
-
-def _tensor_nbytes(tensor: torch.Tensor) -> int:
-    return tensor.numel() * tensor.element_size()
-
-
-def _format_gib(num_bytes: int) -> str:
-    return f"{num_bytes / (1024**3):.2f} GiB"
-
-
-def _log_cuda_memory(stage: str, device: str | torch.device) -> None:
-    device = torch.device(device)
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return
-
-    device_index = device.index if device.index is not None else torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device_index)
-    allocated = torch.cuda.memory_allocated(device_index)
-    reserved = torch.cuda.memory_reserved(device_index)
-    max_allocated = torch.cuda.max_memory_allocated(device_index)
-    max_reserved = torch.cuda.max_memory_reserved(device_index)
-    print(
-        f"[INFO] CUDA memory @ {stage}: "
-        f"allocated={_format_gib(allocated)}, reserved={_format_gib(reserved)}, "
-        f"max_allocated={_format_gib(max_allocated)}, max_reserved={_format_gib(max_reserved)}, "
-        f"total={_format_gib(props.total_memory)} on {props.name}"
-    )
-
-
-def _log_system_gpu_memory(stage: str, device: str | torch.device) -> None:
-    device = torch.device(device)
-    if device.type != "cuda":
-        return
-
-    device_index = device.index if device.index is not None else 0
-
-    try:
-        import pynvml
-
-        pynvml.nvmlInit()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
-        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        print(
-            f"[INFO] System GPU memory @ {stage}: "
-            f"used={_format_gib(mem.used)}, free={_format_gib(mem.free)}, total={_format_gib(mem.total)}"
-        )
-        return
-    except Exception:
-        pass
-
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                f"--id={device_index}",
-                "--query-gpu=memory.used,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        used_mib, total_mib = [part.strip() for part in result.stdout.strip().split(",", maxsplit=1)]
-        used_bytes = int(used_mib) * 1024 * 1024
-        total_bytes = int(total_mib) * 1024 * 1024
-        print(
-            f"[INFO] System GPU memory @ {stage}: "
-            f"used={_format_gib(used_bytes)}, total={_format_gib(total_bytes)}"
-        )
-    except Exception:
-        pass
-
-
-def _maybe_sync_cuda(stage: str, device: str | torch.device) -> None:
-    if os.getenv("WBT_SYNC_CUDA_DEBUG") != "1":
-        return
-
-    device = torch.device(device)
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return
-
-    device_index = device.index if device.index is not None else torch.cuda.current_device()
-    torch.cuda.synchronize(device_index)
-    print(f"[INFO] CUDA synchronize passed @ {stage}")
-
-
-def _log_torch_cuda_stack(device: str | torch.device) -> None:
-    device = torch.device(device)
-    print(f"[INFO] Torch stack: torch={torch.__version__}, torch_cuda={torch.version.cuda}")
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return
-
-    device_index = device.index if device.index is not None else torch.cuda.current_device()
-    capability = torch.cuda.get_device_capability(device_index)
-    arch_list = []
-    try:
-        arch_list = torch.cuda.get_arch_list()
-    except Exception:
-        pass
-    print(
-        f"[INFO] CUDA device capability: sm_{capability[0]}{capability[1]} "
-        f"on {torch.cuda.get_device_name(device_index)}; "
-        f"torch arch list={arch_list}"
-    )
-
-
-def _log_python_env_stack() -> None:
-    conda_env = os.getenv("CONDA_DEFAULT_ENV")
-    conda_prefix = os.getenv("CONDA_PREFIX")
-    conda_shlvl = os.getenv("CONDA_SHLVL")
-    print(
-        "[INFO] Python env stack: "
-        f"sys.executable={sys.executable}, "
-        f"CONDA_DEFAULT_ENV={conda_env!r}, CONDA_PREFIX={conda_prefix!r}, CONDA_SHLVL={conda_shlvl!r}"
-    )
-    try:
-        shlvl = int(conda_shlvl) if conda_shlvl is not None else 0
-    except ValueError:
-        shlvl = 0
-    if shlvl > 1:
-        print(
-            "[WARN] Detected stacked conda environments (CONDA_SHLVL > 1). "
-            "This can mix shared libraries across envs even when `which python` looks correct."
-        )
-
-
-def _check_blackwell_torch_compatibility(device: str | torch.device) -> None:
-    device = torch.device(device)
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return
-
-    device_index = device.index if device.index is not None else torch.cuda.current_device()
-    capability = torch.cuda.get_device_capability(device_index)
-    device_name = torch.cuda.get_device_name(device_index)
-    torch_cuda_version = _parse_cuda_version(torch.version.cuda)
-
-    # NVIDIA documents Blackwell support starting with CUDA 12.8.
-    # Isaac Lab 2.1.0 also recommends cu128 nightly for 50-series GPUs
-    # instead of the default torch 2.5.1/cu121 stack bundled with Isaac Sim.
-    is_probably_blackwell = capability[0] >= 10 or "blackwell" in device_name.lower()
-    if is_probably_blackwell and (torch_cuda_version is None or torch_cuda_version < (12, 8)):
-        raise RuntimeError(
-            "Detected a likely Blackwell GPU "
-            f"({device_name}, sm_{capability[0]}{capability[1]}) with torch CUDA "
-            f"{torch.version.cuda!r}. This stack is likely incompatible. "
-            "Official NVIDIA CUDA docs add Blackwell support in CUDA 12.8, and Isaac Lab 2.1.0 "
-            "explicitly recommends a cu128/nightly PyTorch build for 50-series GPUs instead of "
-            "the default torch 2.5.1/cu121 install. Please upgrade the remote environment to a "
-            "PyTorch build with CUDA 12.8+ (or newer) before debugging this repo further."
-        )
-
-
-def _run_cublas_smoke_test(stage: str, device: str | torch.device, batch_size: int = 4) -> None:
-    device = torch.device(device)
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return
-
-    x = torch.randn(batch_size, 160, device=device, dtype=torch.float32)
-    weight = torch.randn(512, 160, device=device, dtype=torch.float32)
-    bias = torch.randn(512, device=device, dtype=torch.float32)
-    y = F.linear(x, weight, bias)
-    device_index = device.index if device.index is not None else torch.cuda.current_device()
-    torch.cuda.synchronize(device_index)
-    print(
-        f"[INFO] cuBLAS smoke test passed @ {stage}: "
-        f"input_shape={tuple(x.shape)}, output_shape={tuple(y.shape)}"
-    )
-
-
-def _extract_privileged_obs(extras: object) -> torch.Tensor | None:
-    if not isinstance(extras, dict):
-        return None
-    observations = extras.get("observations")
-    if not isinstance(observations, dict):
-        return None
-    critic_obs = observations.get("critic")
-    return critic_obs if isinstance(critic_obs, torch.Tensor) else None
-
-
-def _log_tensor_summary(name: str, tensor: torch.Tensor | None) -> None:
-    if tensor is None:
-        print(f"[INFO] Tensor summary: {name}=None")
-        return
-    finite = bool(torch.isfinite(tensor).all().item())
-    print(
-        f"[INFO] Tensor summary: {name}.shape={tuple(tensor.shape)}, "
-        f"{name}.device={tensor.device}, {name}.dtype={tensor.dtype}, finite={finite}"
-    )
-
-
-def _preflight_env_and_policy(env, runner, device: str | torch.device) -> None:
-    print("[INFO] Running env/policy preflight before learn...")
-    obs, extras = env.get_observations()
-    _maybe_sync_cuda("after get_observations preflight", device)
-    privileged_obs = _extract_privileged_obs(extras)
-    _log_tensor_summary("policy_obs", obs)
-    _log_tensor_summary("critic_obs", privileged_obs)
-
-    with torch.no_grad():
-        _ = runner.alg.act(obs, privileged_obs)
-    _maybe_sync_cuda("after policy act preflight", device)
-    print("[INFO] Env/policy preflight passed before learn.")
-
-
-def _maybe_run_single_step_preflight(env, runner, device: str | torch.device) -> None:
-    steps_env = os.getenv("WBT_STEP_PREFLIGHT_STEPS")
-    if steps_env is None:
-        steps = 1 if os.getenv("WBT_STEP_PREFLIGHT") == "1" else 0
-    else:
-        steps = int(steps_env)
-
-    if steps <= 0:
-        return
-
-    print(f"[INFO] Running rollout preflight before learn for {steps} step(s)...")
-    obs, extras = env.get_observations()
-    privileged_obs = _extract_privileged_obs(extras)
-    next_obs = obs
-    next_privileged_obs = privileged_obs
-
-    for step_idx in range(steps):
-        with torch.no_grad():
-            actions = runner.alg.act(next_obs, next_privileged_obs)
-        _maybe_sync_cuda(f"after rollout preflight act step {step_idx}", device)
-        if step_idx == 0 or step_idx == steps - 1:
-            _log_tensor_summary("preflight_actions", actions)
-
-        next_obs, rewards, dones, infos = env.step(actions)
-        _maybe_sync_cuda(f"after rollout preflight env.step step {step_idx}", device)
-        next_privileged_obs = _extract_privileged_obs(infos)
-
-        if step_idx == 0 or step_idx == steps - 1:
-            _log_tensor_summary("next_policy_obs", next_obs)
-            _log_tensor_summary("next_critic_obs", next_privileged_obs)
-            _log_tensor_summary("rewards", rewards if isinstance(rewards, torch.Tensor) else None)
-            _log_tensor_summary("dones", dones if isinstance(dones, torch.Tensor) else None)
-
-    with torch.no_grad():
-        _ = runner.alg.act(next_obs, next_privileged_obs)
-    _maybe_sync_cuda("after rollout preflight final act", device)
-    print("[INFO] Rollout preflight passed before learn.")
-
-
-def _maybe_run_backward_preflight(env, runner, device: str | torch.device) -> None:
-    if os.getenv("WBT_BACKWARD_PREFLIGHT") != "1":
-        return
-
-    print("[INFO] Running backward preflight before learn...")
-    obs, extras = env.get_observations()
-    privileged_obs = _extract_privileged_obs(extras)
-    policy = getattr(runner.alg, "policy", None)
-    if policy is None:
-        raise RuntimeError("Backward preflight expected runner.alg.policy but it was not found.")
-    if not hasattr(policy, "actor") or not hasattr(policy, "critic"):
-        raise RuntimeError("Backward preflight expected policy.actor and policy.critic modules.")
-
-    optimizer = getattr(runner.alg, "optimizer", None)
-    batch_sizes = [1, 6, 24]
-    if hasattr(env.unwrapped, "num_envs"):
-        batch_sizes.append(int(env.unwrapped.num_envs))
-    batch_sizes = sorted({batch_size for batch_size in batch_sizes if batch_size > 0})
-
-    critic_obs = privileged_obs if privileged_obs is not None else obs
-    for batch_size in batch_sizes:
-        actor_batch = obs.repeat(batch_size, 1)
-        critic_batch = critic_obs.repeat(batch_size, 1)
-        if optimizer is not None:
-            optimizer.zero_grad(set_to_none=True)
-
-        actor_out = policy.actor(actor_batch)
-        critic_out = policy.critic(critic_batch)
-        loss = actor_out.float().square().mean() + critic_out.float().square().mean()
-        loss.backward()
-        _maybe_sync_cuda(f"after backward preflight batch_size {batch_size}", device)
-        print(
-            f"[INFO] Backward preflight passed: batch_size={batch_size}, "
-            f"actor_out_shape={tuple(actor_out.shape)}, critic_out_shape={tuple(critic_out.shape)}"
-        )
-
-        if optimizer is not None:
-            optimizer.zero_grad(set_to_none=True)
-
-
-def _log_motion_storage(env: gym.Env, device: str | torch.device) -> None:
-    motion_cmd = env.unwrapped.command_manager.get_term("motion")
-    library_cpu_bytes = 0
-    library_gpu_bytes = 0
-    library_devices: set[str] = set()
-    motion_tensor_names = (
-        "joint_pos",
-        "joint_vel",
-        "body_pos_w",
-        "body_quat_w",
-        "body_lin_vel_w",
-        "body_ang_vel_w",
-    )
-    active_buffer_names = (
-        "_joint_pos",
-        "_joint_vel",
-        "_body_pos_w",
-        "_body_quat_w",
-        "_body_lin_vel_w",
-        "_body_ang_vel_w",
-    )
-
-    for motion in motion_cmd.motions:
-        for name in motion_tensor_names:
-            tensor = getattr(motion, name)
-            nbytes = _tensor_nbytes(tensor)
-            library_devices.add(str(tensor.device))
-            if tensor.device.type == "cuda":
-                library_gpu_bytes += nbytes
-            else:
-                library_cpu_bytes += nbytes
-
-    active_gpu_bytes = sum(_tensor_nbytes(getattr(motion_cmd, name)) for name in active_buffer_names)
-    print(
-        "[INFO] Motion storage: "
-        f"num_motions={motion_cmd.num_motions}, "
-        f"library_devices={sorted(library_devices)}, "
-        f"library_cpu={_format_gib(library_cpu_bytes)}, "
-        f"library_gpu={_format_gib(library_gpu_bytes)}, "
-        f"active_gpu_buffers={_format_gib(active_gpu_bytes)}"
-    )
-
-    _log_cuda_memory("after motion storage inspection", device)
-    _log_system_gpu_memory("after motion storage inspection", device)
-
-
 def _disable_training_debug_vis(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg) -> None:
-    if os.getenv("WBT_ENABLE_TRAIN_DEBUG_VIS") == "1":
-        print("[INFO] Keeping training debug visualization enabled because WBT_ENABLE_TRAIN_DEBUG_VIS=1.")
-        return
-
-    disabled: list[str] = []
-
     motion_cfg = getattr(getattr(env_cfg, "commands", None), "motion", None)
-    if motion_cfg is not None and getattr(motion_cfg, "debug_vis", False):
+    if motion_cfg is not None:
         motion_cfg.debug_vis = False
-        disabled.append("commands.motion.debug_vis")
 
     contact_sensor_cfg = getattr(getattr(env_cfg, "scene", None), "contact_forces", None)
-    if contact_sensor_cfg is not None and getattr(contact_sensor_cfg, "debug_vis", False):
+    if contact_sensor_cfg is not None:
         contact_sensor_cfg.debug_vis = False
-        disabled.append("scene.contact_forces.debug_vis")
-
-    if disabled:
-        print(f"[INFO] Disabled training debug visualization: {', '.join(disabled)}")
 
 
 def _normalize_registry_names(registry_names: list[str]) -> list[str]:
@@ -543,26 +191,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-    _log_python_env_stack()
-    _log_torch_cuda_stack(env_cfg.sim.device)
-    _check_blackwell_torch_compatibility(env_cfg.sim.device)
-    _run_cublas_smoke_test("before env creation", env_cfg.sim.device)
-
     # load one or more motion files from wandb registry or local recursive directory
     motion_file, registry_names = _resolve_motion_files()
     env_cfg.commands.motion.motion_file = motion_file
     _disable_training_debug_vis(env_cfg)
-    if isinstance(motion_file, list):
-        print(f"[INFO] Loaded {len(motion_file)} motion files for training.")
-        if args_cli.num_envs is None:
-            print(
-                "[WARN] --num_envs was not provided, so the task default "
-                f"num_envs={env_cfg.scene.num_envs} will be used. "
-                "Multi-motion training now keeps reference motions on CPU by default, "
-                "but the simulator itself can still exhaust GPU memory on smaller cards. "
-                "If you still see CUDA OOM or CUBLAS initialization failures on the target machine, "
-                "retry with a smaller --num_envs."
-            )
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -576,9 +208,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-    _maybe_sync_cuda("after env creation", agent_cfg.device)
-    _run_cublas_smoke_test("after env creation", agent_cfg.device)
-    _log_motion_storage(env, agent_cfg.device)
     # wrap for video recording
     if args_cli.video:
         video_kwargs = {
@@ -602,10 +231,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner = OnPolicyRunner(
         env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device, registry_name=registry_names
     )
-    _maybe_sync_cuda("after runner init", agent_cfg.device)
-    _run_cublas_smoke_test("after runner init", agent_cfg.device)
-    _log_cuda_memory("after runner init", agent_cfg.device)
-    _log_system_gpu_memory("after runner init", agent_cfg.device)
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # save resume path before creating a new log_dir
@@ -623,13 +248,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
     # run training
-    _preflight_env_and_policy(env, runner, agent_cfg.device)
-    _maybe_run_single_step_preflight(env, runner, agent_cfg.device)
-    _maybe_run_backward_preflight(env, runner, agent_cfg.device)
-    _maybe_sync_cuda("before learn", agent_cfg.device)
-    _run_cublas_smoke_test("before learn", agent_cfg.device, batch_size=max(1, env.unwrapped.num_envs))
-    _log_cuda_memory("before learn", agent_cfg.device)
-    _log_system_gpu_memory("before learn", agent_cfg.device)
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 
     # close the simulator
