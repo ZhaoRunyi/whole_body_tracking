@@ -27,6 +27,28 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+SAMPLING_PRESET_DEFAULTS = {
+    "beyondmimic": {
+        "motion_resample_scope": "episode_reset_and_rollover",
+        "phase_sampling_window": "full_motion",
+        "phase_sampling_strategy": "adaptive_legacy",
+        "motion_end_behavior": "rollover_resample",
+    },
+    "hover": {
+        "motion_resample_scope": "episode_reset_only",
+        "phase_sampling_window": "truncate_to_episode",
+        "phase_sampling_strategy": "uniform",
+        "motion_end_behavior": "terminate_episode",
+    },
+    "hover_adaptive": {
+        "motion_resample_scope": "episode_reset_only",
+        "phase_sampling_window": "truncate_to_episode",
+        "phase_sampling_strategy": "adaptive_per_motion",
+        "motion_end_behavior": "terminate_episode",
+    },
+}
+
+
 class MotionLoader:
     def __init__(self, motion_file: str, body_indexes: Sequence[int], device: str = "cpu"):
         assert os.path.isfile(motion_file), f"Invalid file path: {motion_file}"
@@ -107,8 +129,10 @@ class MotionCommand(CommandTerm):
             self.motion_prob = torch.ones(self.num_motions, dtype=torch.float32, device=self.device) / float(
                 self.num_motions
             )
+        self._resolve_sampling_policy(env)
 
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.motion_ended = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._joint_pos = torch.empty(
             (self.num_envs, *self.motion.joint_pos.shape[1:]), dtype=self.motion.joint_pos.dtype, device=self.device
         )
@@ -136,9 +160,9 @@ class MotionCommand(CommandTerm):
         self.body_quat_relative_w[:, :, 0] = 1.0
         self._refresh_motion_buffers()
 
-        self.bin_count = int(self.motion.time_step_total // (1 / (env.cfg.decimation * env.cfg.sim.dt))) + 1
-        self.bin_failed_count = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
-        self._current_bin_failed = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
+        self.bin_count = int(self.motion_bin_counts[0].item())
+        self.bin_failed_count = torch.zeros((self.num_motions, self.max_bin_count), dtype=torch.float, device=self.device)
+        self._current_bin_failed = torch.zeros((self.num_motions, self.max_bin_count), dtype=torch.float, device=self.device)
         self.kernel = torch.tensor(
             [self.cfg.adaptive_lambda**i for i in range(self.cfg.adaptive_kernel_size)], device=self.device
         )
@@ -155,6 +179,49 @@ class MotionCommand(CommandTerm):
         self.metrics["sampling_entropy"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sampling_top1_prob"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["sampling_top1_bin"] = torch.zeros(self.num_envs, device=self.device)
+
+    def _resolve_sampling_policy(self, env: ManagerBasedRLEnv) -> None:
+        if self.cfg.sampling_preset not in SAMPLING_PRESET_DEFAULTS:
+            raise ValueError(f"Unsupported sampling_preset: {self.cfg.sampling_preset}")
+
+        defaults = SAMPLING_PRESET_DEFAULTS[self.cfg.sampling_preset]
+        self.motion_resample_scope = self.cfg.motion_resample_scope or defaults["motion_resample_scope"]
+        self.phase_sampling_window = self.cfg.phase_sampling_window or defaults["phase_sampling_window"]
+        self.phase_sampling_strategy = self.cfg.phase_sampling_strategy or defaults["phase_sampling_strategy"]
+        self.motion_end_behavior = self.cfg.motion_end_behavior or defaults["motion_end_behavior"]
+
+        valid_motion_resample_scope = {"episode_reset_only", "episode_reset_and_rollover"}
+        valid_phase_sampling_window = {"full_motion", "truncate_to_episode"}
+        valid_phase_sampling_strategy = {"uniform", "adaptive_legacy", "adaptive_per_motion"}
+        valid_motion_end_behavior = {"rollover_resample", "terminate_episode"}
+
+        if self.motion_resample_scope not in valid_motion_resample_scope:
+            raise ValueError(f"Unsupported motion_resample_scope: {self.motion_resample_scope}")
+        if self.phase_sampling_window not in valid_phase_sampling_window:
+            raise ValueError(f"Unsupported phase_sampling_window: {self.phase_sampling_window}")
+        if self.phase_sampling_strategy not in valid_phase_sampling_strategy:
+            raise ValueError(f"Unsupported phase_sampling_strategy: {self.phase_sampling_strategy}")
+        if self.motion_end_behavior not in valid_motion_end_behavior:
+            raise ValueError(f"Unsupported motion_end_behavior: {self.motion_end_behavior}")
+
+        self.env_step_dt = env.cfg.decimation * env.cfg.sim.dt
+        self.steps_per_bin = max(int(round(1.0 / self.env_step_dt)), 1)
+        self.episode_length_steps = max(int(round(env.cfg.episode_length_s / self.env_step_dt)), 1)
+        if self.phase_sampling_window == "truncate_to_episode":
+            self.motion_sampling_max_starts = torch.clamp(self.motion_lengths - self.episode_length_steps, min=0)
+        else:
+            self.motion_sampling_max_starts = torch.clamp(self.motion_lengths - 1, min=0)
+
+        motion_bin_counts: list[int] = []
+        for motion_id in range(self.num_motions):
+            if self.phase_sampling_strategy == "adaptive_legacy" and self.num_motions == 1:
+                bin_count = int(self.motion.time_step_total // self.steps_per_bin) + 1
+            else:
+                sample_span = int(self.motion_sampling_max_starts[motion_id].item()) + 1
+                bin_count = max(int(sample_span // self.steps_per_bin) + 1, 1)
+            motion_bin_counts.append(bin_count)
+        self.motion_bin_counts = torch.tensor(motion_bin_counts, dtype=torch.long, device=self.device)
+        self.max_bin_count = int(self.motion_bin_counts.max().item())
 
     @property
     def command(self) -> torch.Tensor:  # TODO Consider again if this is the best observation
@@ -299,65 +366,158 @@ class MotionCommand(CommandTerm):
         self.metrics["error_joint_pos"] = torch.norm(self.joint_pos - self.robot_joint_pos, dim=-1)
         self.metrics["error_joint_vel"] = torch.norm(self.joint_vel - self.robot_joint_vel, dim=-1)
 
-    def _adaptive_sampling(self, env_ids: Sequence[int]):
-        if len(env_ids) == 0:
-            return
-        # For multi-motion training we sample uniformly on each chosen motion timeline.
-        # Single-motion behavior remains identical to the previous adaptive bin sampling.
-        if self.num_motions > 1:
-            max_steps = self.motion_lengths[self.motion_ids[env_ids]]
-            random_uniform = torch.rand(len(env_ids), dtype=torch.float32, device=self.device)
-            self.time_steps[env_ids] = (random_uniform * (max_steps.float() - 1.0)).long()
-            self.metrics["sampling_entropy"][:] = 1.0
-            self.metrics["sampling_top1_prob"][:] = 0.0
-            self.metrics["sampling_top1_bin"][:] = 0.0
+    def _set_uniform_sampling_metrics(self, env_ids: torch.Tensor) -> None:
+        self.metrics["sampling_entropy"][env_ids] = 1.0
+        self.metrics["sampling_top1_prob"][env_ids] = 0.0
+        self.metrics["sampling_top1_bin"][env_ids] = 0.0
+
+    def _sample_uniform_full_motion_legacy(self, env_ids: torch.Tensor) -> None:
+        max_steps = self.motion_lengths[self.motion_ids[env_ids]]
+        random_uniform = torch.rand(len(env_ids), dtype=torch.float32, device=self.device)
+        self.time_steps[env_ids] = (random_uniform * (max_steps.float() - 1.0)).long()
+
+    def _sample_uniform_time_steps(self, env_ids: torch.Tensor) -> None:
+        if env_ids.numel() == 0:
             return
 
+        if self.phase_sampling_window == "full_motion" and self.phase_sampling_strategy == "adaptive_legacy":
+            self._sample_uniform_full_motion_legacy(env_ids)
+            self._set_uniform_sampling_metrics(env_ids)
+            return
+
+        sample_counts = self.motion_sampling_max_starts[self.motion_ids[env_ids]] + 1
+        random_uniform = torch.rand(len(env_ids), dtype=torch.float32, device=self.device)
+        self.time_steps[env_ids] = torch.floor(random_uniform * sample_counts.float()).long()
+        self.time_steps[env_ids] = torch.minimum(self.time_steps[env_ids], self.motion_sampling_max_starts[self.motion_ids[env_ids]])
+        self._set_uniform_sampling_metrics(env_ids)
+
+    def _update_failure_statistics_legacy(self, env_ids: torch.Tensor) -> None:
         episode_failed = self._env.termination_manager.terminated[env_ids]
-        if torch.any(episode_failed):
-            current_bin_index = torch.clamp(
-                (self.time_steps * self.bin_count) // max(self.motion.time_step_total, 1), 0, self.bin_count - 1
-            )
-            fail_bins = current_bin_index[env_ids][episode_failed]
-            self._current_bin_failed[:] = torch.bincount(fail_bins, minlength=self.bin_count)
+        if self.motion_end_behavior == "terminate_episode":
+            episode_failed = episode_failed & (~self.motion_ended[env_ids])
+        self._current_bin_failed[0].zero_()
+        if not torch.any(episode_failed):
+            return
 
-        # Sample
-        sampling_probabilities = self.bin_failed_count + self.cfg.adaptive_uniform_ratio / float(self.bin_count)
+        current_bin_index = torch.clamp(
+            (self.time_steps * self.bin_count) // max(self.motion.time_step_total, 1), 0, self.bin_count - 1
+        )
+        fail_bins = current_bin_index[env_ids][episode_failed]
+        self._current_bin_failed[0, : self.bin_count] = torch.bincount(fail_bins, minlength=self.bin_count)
+
+    def _update_failure_statistics_per_motion(self, env_ids: torch.Tensor) -> None:
+        self._current_bin_failed.zero_()
+        episode_failed = self._env.termination_manager.terminated[env_ids]
+        if self.motion_end_behavior == "terminate_episode":
+            episode_failed = episode_failed & (~self.motion_ended[env_ids])
+        if not torch.any(episode_failed):
+            return
+
+        failed_env_ids = env_ids[episode_failed]
+        failed_motion_ids = self.motion_ids[failed_env_ids]
+        failed_time_steps = self.time_steps[failed_env_ids]
+        for motion_id in torch.unique(failed_motion_ids).tolist():
+            motion_mask = failed_motion_ids == motion_id
+            if not torch.any(motion_mask):
+                continue
+            bin_count = int(self.motion_bin_counts[motion_id].item())
+            sample_span = int(self.motion_sampling_max_starts[motion_id].item()) + 1
+            current_bin_index = torch.clamp(
+                (failed_time_steps[motion_mask] * bin_count) // max(sample_span, 1), 0, bin_count - 1
+            )
+            self._current_bin_failed[motion_id, :bin_count] = torch.bincount(current_bin_index, minlength=bin_count)
+
+    def _smooth_sampling_probabilities(self, base_probabilities: torch.Tensor) -> torch.Tensor:
         sampling_probabilities = torch.nn.functional.pad(
-            sampling_probabilities.unsqueeze(0).unsqueeze(0),
-            (0, self.cfg.adaptive_kernel_size - 1),  # Non-causal kernel
+            base_probabilities.unsqueeze(0).unsqueeze(0),
+            (0, self.cfg.adaptive_kernel_size - 1),
             mode="replicate",
         )
         sampling_probabilities = torch.nn.functional.conv1d(sampling_probabilities, self.kernel.view(1, 1, -1)).view(-1)
+        return sampling_probabilities / sampling_probabilities.sum()
 
-        sampling_probabilities = sampling_probabilities / sampling_probabilities.sum()
+    def _adaptive_sampling_legacy(self, env_ids: torch.Tensor) -> None:
+        self._update_failure_statistics_legacy(env_ids)
+
+        sampling_probabilities = self.bin_failed_count[0, : self.bin_count]
+        sampling_probabilities = sampling_probabilities + self.cfg.adaptive_uniform_ratio / float(self.bin_count)
+        sampling_probabilities = self._smooth_sampling_probabilities(sampling_probabilities)
 
         sampled_bins = torch.multinomial(sampling_probabilities, len(env_ids), replacement=True)
-
         self.time_steps[env_ids] = (
             (sampled_bins + sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device))
             / self.bin_count
             * (self.motion.time_step_total - 1)
         ).long()
 
-        # Metrics
         H = -(sampling_probabilities * (sampling_probabilities + 1e-12).log()).sum()
         H_norm = H / math.log(self.bin_count)
         pmax, imax = sampling_probabilities.max(dim=0)
-        self.metrics["sampling_entropy"][:] = H_norm
-        self.metrics["sampling_top1_prob"][:] = pmax
-        self.metrics["sampling_top1_bin"][:] = imax.float() / self.bin_count
+        self.metrics["sampling_entropy"][env_ids] = H_norm
+        self.metrics["sampling_top1_prob"][env_ids] = pmax
+        self.metrics["sampling_top1_bin"][env_ids] = imax.float() / self.bin_count
+
+    def _adaptive_sampling_per_motion(self, env_ids: torch.Tensor) -> None:
+        self._update_failure_statistics_per_motion(env_ids)
+        env_motion_ids = self.motion_ids[env_ids]
+        for motion_id in torch.unique(env_motion_ids).tolist():
+            motion_env_ids = env_ids[env_motion_ids == motion_id]
+            if motion_env_ids.numel() == 0:
+                continue
+            bin_count = int(self.motion_bin_counts[motion_id].item())
+            sample_span = int(self.motion_sampling_max_starts[motion_id].item()) + 1
+
+            sampling_probabilities = self.bin_failed_count[motion_id, :bin_count]
+            sampling_probabilities = sampling_probabilities + self.cfg.adaptive_uniform_ratio / float(bin_count)
+            sampling_probabilities = self._smooth_sampling_probabilities(sampling_probabilities)
+
+            sampled_bins = torch.multinomial(sampling_probabilities, motion_env_ids.numel(), replacement=True)
+            sampled_steps = torch.floor(
+                (sampled_bins + torch.rand(motion_env_ids.numel(), device=self.device)) / bin_count * sample_span
+            ).long()
+            self.time_steps[motion_env_ids] = torch.clamp(sampled_steps, max=max(sample_span - 1, 0))
+
+            H = -(sampling_probabilities * (sampling_probabilities + 1e-12).log()).sum()
+            H_norm = H / max(math.log(bin_count), 1.0)
+            pmax, imax = sampling_probabilities.max(dim=0)
+            self.metrics["sampling_entropy"][motion_env_ids] = H_norm
+            self.metrics["sampling_top1_prob"][motion_env_ids] = pmax
+            self.metrics["sampling_top1_bin"][motion_env_ids] = imax.float() / bin_count
+
+    def _should_resample_motion_ids(self) -> bool:
+        if self.num_motions == 1 or not self.cfg.lock_motion_per_episode:
+            return False
+        if self.motion_resample_scope == "episode_reset_only":
+            return self._resample_reason == "episode_reset"
+        return self._resample_reason != "unknown"
+
+    def _adaptive_sampling(self, env_ids: Sequence[int]):
+        if len(env_ids) == 0:
+            return
+        env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        if self.phase_sampling_strategy == "uniform":
+            self._sample_uniform_time_steps(env_ids_tensor)
+            return
+        if self.phase_sampling_strategy == "adaptive_per_motion":
+            self._adaptive_sampling_per_motion(env_ids_tensor)
+            return
+        if self.num_motions > 1:
+            self._sample_uniform_time_steps(env_ids_tensor)
+            return
+        self._adaptive_sampling_legacy(env_ids_tensor)
 
     def _resample_command(self, env_ids: Sequence[int]):
         if len(env_ids) == 0:
             return
+        env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         previous_motion_ids = self.motion_ids[env_ids].clone()
         previous_time_steps = self.time_steps[env_ids].clone()
-        if self.cfg.lock_motion_per_episode or self.num_motions == 1:
-            self.motion_ids[env_ids] = torch.multinomial(self.motion_prob, len(env_ids), replacement=True)
-        self._adaptive_sampling(env_ids)
-        self._record_refpose_resample_events(env_ids, previous_motion_ids, previous_time_steps)
-        self._refresh_motion_buffers(env_ids)
+        if self._should_resample_motion_ids():
+            self.motion_ids[env_ids_tensor] = torch.multinomial(self.motion_prob, len(env_ids), replacement=True)
+        self.motion_ended[env_ids_tensor] = False
+        self._adaptive_sampling(env_ids_tensor)
+        self._record_refpose_resample_events(env_ids_tensor, previous_motion_ids, previous_time_steps)
+        self._refresh_motion_buffers(env_ids_tensor)
 
         root_pos = self.body_pos_w[:, 0].clone()
         root_ori = self.body_quat_w[:, 0].clone()
@@ -391,11 +551,20 @@ class MotionCommand(CommandTerm):
         )
 
     def _update_command(self):
+        self.motion_ended.zero_()
         self.time_steps += 1
         ended_env_ids = torch.where(self.time_steps >= self.motion_lengths[self.motion_ids])[0]
-        self._resample_reason = "motion_rollover"
-        self._resample_command(ended_env_ids)
-        self._resample_reason = "unknown"
+        if self.motion_end_behavior == "terminate_episode":
+            if ended_env_ids.numel() > 0:
+                self.motion_ended[ended_env_ids] = True
+                self.time_steps[ended_env_ids] = torch.clamp(
+                    self.motion_lengths[self.motion_ids[ended_env_ids]] - 1,
+                    min=0,
+                )
+        else:
+            self._resample_reason = "motion_rollover"
+            self._resample_command(ended_env_ids)
+            self._resample_reason = "unknown"
         self._refresh_motion_buffers()
 
         anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
@@ -503,6 +672,11 @@ class MotionCommandCfg(CommandTermCfg):
 
     pose_range: dict[str, tuple[float, float]] = {}
     velocity_range: dict[str, tuple[float, float]] = {}
+    sampling_preset: str = "beyondmimic"
+    motion_resample_scope: str | None = None
+    phase_sampling_window: str | None = None
+    phase_sampling_strategy: str | None = None
+    motion_end_behavior: str | None = None
     motion_sampling: str = "uniform"
     motion_weights: list[float] | None = None
     lock_motion_per_episode: bool = True

@@ -27,6 +27,17 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--sampling_strategy",
+    type=str,
+    default=None,
+    help=(
+        "Motion sampling preset or comma-separated overrides. Examples: "
+        "'beyondmimic', 'hover', 'hover_adaptive', "
+        "'hover,phase=adaptive_per_motion', "
+        "'resample_scope=episode_reset_only,window=truncate_to_episode,phase=uniform,motion_end=terminate_episode'."
+    ),
+)
+parser.add_argument(
     "--render_refpose",
     action=argparse.BooleanOptionalAction,
     default=True,
@@ -93,6 +104,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # Import extensions to set up environment tasks
 import whole_body_tracking.tasks  # noqa: F401
+from whole_body_tracking.tasks.tracking.mdp.commands import SAMPLING_PRESET_DEFAULTS
 from whole_body_tracking.utils.my_on_policy_runner import MotionOnPolicyRunner as OnPolicyRunner
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -111,6 +123,19 @@ REQUIRED_MOTION_KEYS = (
     "body_ang_vel_w",
 )
 
+SAMPLING_STRATEGY_KEY_ALIASES = {
+    "preset": "sampling_preset",
+    "sampling_preset": "sampling_preset",
+    "resample_scope": "motion_resample_scope",
+    "motion_resample_scope": "motion_resample_scope",
+    "window": "phase_sampling_window",
+    "phase_sampling_window": "phase_sampling_window",
+    "phase": "phase_sampling_strategy",
+    "phase_sampling_strategy": "phase_sampling_strategy",
+    "motion_end": "motion_end_behavior",
+    "motion_end_behavior": "motion_end_behavior",
+}
+
 
 def _configure_training_visualization(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, render_refpose: bool
@@ -122,6 +147,61 @@ def _configure_training_visualization(
     contact_sensor_cfg = getattr(getattr(env_cfg, "scene", None), "contact_forces", None)
     if contact_sensor_cfg is not None:
         contact_sensor_cfg.debug_vis = False
+
+
+def _parse_sampling_strategy_spec(spec: str | None) -> dict[str, str]:
+    if spec is None:
+        return {}
+
+    tokens = [token.strip() for token in spec.split(",") if token.strip()]
+    if not tokens:
+        raise ValueError("--sampling_strategy cannot be empty.")
+
+    overrides: dict[str, str] = {}
+    for token in tokens:
+        if "=" not in token:
+            key = "sampling_preset"
+            value = token
+        else:
+            raw_key, value = token.split("=", 1)
+            key = SAMPLING_STRATEGY_KEY_ALIASES.get(raw_key.strip())
+            value = value.strip()
+            if key is None:
+                valid_keys = ", ".join(sorted(SAMPLING_STRATEGY_KEY_ALIASES))
+                raise ValueError(f"Unsupported --sampling_strategy key '{raw_key.strip()}'. Valid keys: {valid_keys}")
+            if not value:
+                raise ValueError(f"Missing value for --sampling_strategy key '{raw_key.strip()}'.")
+        overrides[key] = value
+
+    return overrides
+
+
+def _apply_sampling_strategy(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, sampling_strategy_spec: str | None
+) -> None:
+    motion_cfg = getattr(getattr(env_cfg, "commands", None), "motion", None)
+    if motion_cfg is None or sampling_strategy_spec is None:
+        return
+
+    overrides = _parse_sampling_strategy_spec(sampling_strategy_spec)
+    for key, value in overrides.items():
+        setattr(motion_cfg, key, value)
+
+    preset_name = getattr(motion_cfg, "sampling_preset", "beyondmimic")
+    preset_defaults = SAMPLING_PRESET_DEFAULTS[preset_name]
+    resolved = {
+        "sampling_preset": preset_name,
+        "motion_resample_scope": getattr(motion_cfg, "motion_resample_scope", None)
+        or preset_defaults["motion_resample_scope"],
+        "phase_sampling_window": getattr(motion_cfg, "phase_sampling_window", None)
+        or preset_defaults["phase_sampling_window"],
+        "phase_sampling_strategy": getattr(motion_cfg, "phase_sampling_strategy", None)
+        or preset_defaults["phase_sampling_strategy"],
+        "motion_end_behavior": getattr(motion_cfg, "motion_end_behavior", None)
+        or preset_defaults["motion_end_behavior"],
+    }
+    resolved_str = ", ".join(f"{key}={value}" for key, value in resolved.items())
+    print(f"[INFO] Motion sampling strategy: {resolved_str}")
 
 
 def _normalize_registry_names(registry_names: list[str]) -> list[str]:
@@ -210,6 +290,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # load one or more motion files from wandb registry or local recursive directory
     motion_file, registry_names = _resolve_motion_files()
     env_cfg.commands.motion.motion_file = motion_file
+    _apply_sampling_strategy(env_cfg, args_cli.sampling_strategy)
     _configure_training_visualization(env_cfg, args_cli.render_refpose)
 
     # specify directory for logging experiments
