@@ -93,6 +93,8 @@ class MotionCommand(CommandTerm):
         self.num_motions = len(self.motions)
         self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.motion_lengths = torch.tensor([m.time_step_total for m in self.motions], dtype=torch.long, device=self.device)
+        self._refpose_log_events: list[dict[str, int | str]] = []
+        self._resample_reason = "unknown"
 
         if self.cfg.motion_sampling not in ("uniform", "weighted"):
             raise ValueError(f"Unsupported motion_sampling: {self.cfg.motion_sampling}")
@@ -157,6 +159,22 @@ class MotionCommand(CommandTerm):
     @property
     def command(self) -> torch.Tensor:  # TODO Consider again if this is the best observation
         return torch.cat([self.joint_pos, self.joint_vel], dim=1)
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
+        self._resample_reason = "episode_reset"
+        try:
+            return super().reset(env_ids=env_ids)
+        finally:
+            self._resample_reason = "unknown"
+
+    def consume_refpose_log_events(self, max_envs: int) -> list[dict[str, int | str]]:
+        if max_envs <= 0:
+            self._refpose_log_events.clear()
+            return []
+
+        events = [event for event in self._refpose_log_events if int(event["env_id"]) < max_envs]
+        self._refpose_log_events.clear()
+        return events
 
     def _refresh_motion_buffers(self, env_ids: Sequence[int] | None = None) -> None:
         if env_ids is None:
@@ -333,9 +351,12 @@ class MotionCommand(CommandTerm):
     def _resample_command(self, env_ids: Sequence[int]):
         if len(env_ids) == 0:
             return
+        previous_motion_ids = self.motion_ids[env_ids].clone()
+        previous_time_steps = self.time_steps[env_ids].clone()
         if self.cfg.lock_motion_per_episode or self.num_motions == 1:
             self.motion_ids[env_ids] = torch.multinomial(self.motion_prob, len(env_ids), replacement=True)
         self._adaptive_sampling(env_ids)
+        self._record_refpose_resample_events(env_ids, previous_motion_ids, previous_time_steps)
         self._refresh_motion_buffers(env_ids)
 
         root_pos = self.body_pos_w[:, 0].clone()
@@ -371,8 +392,10 @@ class MotionCommand(CommandTerm):
 
     def _update_command(self):
         self.time_steps += 1
-        env_ids = torch.where(self.time_steps >= self.motion_lengths[self.motion_ids])[0]
-        self._resample_command(env_ids)
+        ended_env_ids = torch.where(self.time_steps >= self.motion_lengths[self.motion_ids])[0]
+        self._resample_reason = "motion_rollover"
+        self._resample_command(ended_env_ids)
+        self._resample_reason = "unknown"
         self._refresh_motion_buffers()
 
         anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(1, len(self.cfg.body_names), 1)
@@ -391,6 +414,30 @@ class MotionCommand(CommandTerm):
             self.cfg.adaptive_alpha * self._current_bin_failed + (1 - self.cfg.adaptive_alpha) * self.bin_failed_count
         )
         self._current_bin_failed.zero_()
+
+    def _record_refpose_resample_events(
+        self, env_ids: Sequence[int], previous_motion_ids: torch.Tensor, previous_time_steps: torch.Tensor
+    ) -> None:
+        env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        if env_ids_tensor.numel() == 0:
+            return
+
+        for local_idx, env_id_tensor in enumerate(env_ids_tensor):
+            env_id = int(env_id_tensor.item())
+            prev_motion_id = int(previous_motion_ids[local_idx].item())
+            prev_time_step = int(previous_time_steps[local_idx].item())
+            motion_id = int(self.motion_ids[env_id].item())
+            time_step = int(self.time_steps[env_id].item())
+            self._refpose_log_events.append(
+                {
+                    "env_id": env_id,
+                    "reason": self._resample_reason,
+                    "prev_motion_id": prev_motion_id,
+                    "prev_time_step": prev_time_step,
+                    "motion_id": motion_id,
+                    "time_step": time_step,
+                }
+            )
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:

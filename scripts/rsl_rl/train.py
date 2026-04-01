@@ -36,9 +36,9 @@ parser.add_argument(
     "--print_refpose",
     type=int,
     nargs="?",
-    const=8,
-    default=0,
-    help="Print a snapshot of the current reference motion source for the first N environments. Disabled by default.",
+    const=2,
+    default=2,
+    help="Show the current reference motion file/step for the first N environments inside each training summary. Set 0 to disable.",
 )
 parser.add_argument(
     "--registry_name",
@@ -122,30 +122,6 @@ def _configure_training_visualization(
     contact_sensor_cfg = getattr(getattr(env_cfg, "scene", None), "contact_forces", None)
     if contact_sensor_cfg is not None:
         contact_sensor_cfg.debug_vis = False
-
-
-def _maybe_print_refpose_snapshot(env: gym.Env, num_envs_to_print: int) -> None:
-    if num_envs_to_print <= 0:
-        return
-
-    motion_cmd = env.unwrapped.command_manager.get_term("motion")
-    max_envs = min(num_envs_to_print, motion_cmd.num_envs)
-    if max_envs <= 0:
-        return
-
-    print(f"[INFO] Available reference motions ({motion_cmd.num_motions} total):")
-    for motion_id, motion_source in enumerate(motion_cmd.motion_files):
-        print(f"[INFO]   motion[{motion_id}] file={motion_source}")
-
-    print(f"[INFO] Current reference motion snapshot for first {max_envs}/{motion_cmd.num_envs} envs:")
-    for env_id in range(max_envs):
-        motion_id = int(motion_cmd.motion_ids[env_id].item())
-        time_step = int(motion_cmd.time_steps[env_id].item())
-        motion_source = motion_cmd.motion_files[motion_id]
-        print(f"[INFO]   env[{env_id}] -> motion[{motion_id}] step={time_step} file={motion_source}")
-
-    if not motion_cmd.cfg.lock_motion_per_episode:
-        print("[INFO] Reference motion snapshot is not sticky because lock_motion_per_episode=False.")
 
 
 def _normalize_registry_names(registry_names: list[str]) -> list[str]:
@@ -264,8 +240,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
-    _maybe_print_refpose_snapshot(env, args_cli.print_refpose)
-
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env)
 
@@ -273,6 +247,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner = OnPolicyRunner(
         env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device, registry_name=registry_names
     )
+    runner.configure_refpose_logging(args_cli.print_refpose)
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # save resume path before creating a new log_dir
