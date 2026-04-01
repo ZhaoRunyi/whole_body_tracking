@@ -37,6 +37,24 @@ def print_loaded_cuda_libs() -> None:
     print("[INFO] Loaded CUDA libs:")
     for lib in sorted(libs):
         print(f"[INFO]   {lib}")
+    warn_mixed_cuda_libs(sorted(libs))
+
+
+def warn_mixed_cuda_libs(libs: list[str]) -> None:
+    cublas_lib = next((lib for lib in libs if "libcublas.so" in lib and "site-packages" in lib), None)
+    cublaslt_lib = next((lib for lib in libs if "libcublasLt.so" in lib), None)
+    if cublas_lib is None or cublaslt_lib is None:
+        return
+    if cublas_lib.split("/site-packages/")[0] == cublaslt_lib.split("/site-packages/")[0]:
+        return
+
+    print("[WARN] Mixed cuBLAS libraries detected:")
+    print(f"[WARN]   libcublas  loaded from: {cublas_lib}")
+    print(f"[WARN]   libcublasLt loaded from: {cublaslt_lib}")
+    print(
+        "[WARN] This process is mixing CUDA user-space libraries from different installations. "
+        "That is a strong candidate root cause for backward-only cuBLAS failures."
+    )
 
 
 def run_linear_backward(device: torch.device, batch_size: int, in_dim: int, out_dim: int) -> None:
