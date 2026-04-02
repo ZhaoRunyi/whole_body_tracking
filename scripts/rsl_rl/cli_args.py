@@ -20,6 +20,9 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
         "--experiment_name", type=str, default=None, help="Name of the experiment folder where logs will be stored."
     )
     arg_group.add_argument("--run_name", type=str, default=None, help="Run name suffix to the log directory.")
+    arg_group.add_argument(
+        "--save_interval", type=int, default=None, help="Checkpoint save interval in training iterations."
+    )
     # -- load arguments
     arg_group.add_argument("--resume", type=bool, default=None, help="Whether to resume from a checkpoint.")
     arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")
@@ -75,6 +78,8 @@ def update_rsl_rl_cfg(agent_cfg: RslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         agent_cfg.load_checkpoint = args_cli.checkpoint
     if args_cli.run_name is not None:
         agent_cfg.run_name = args_cli.run_name
+    if hasattr(args_cli, "save_interval") and args_cli.save_interval is not None:
+        agent_cfg.save_interval = args_cli.save_interval
     if args_cli.logger is not None:
         agent_cfg.logger = args_cli.logger
     # set the project name for wandb and neptune
