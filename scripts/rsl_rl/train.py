@@ -32,7 +32,7 @@ parser.add_argument(
     default=None,
     help=(
         "Motion sampling preset or comma-separated overrides. Examples: "
-        "'beyondmimic', 'hover', 'hover_adaptive', "
+        "'beyondmimic', 'beyondmimic_adaptive', 'hover', 'hover_adaptive', "
         "'hover,phase=adaptive_per_motion', "
         "'resample_scope=episode_reset_only,window=truncate_to_episode,phase=uniform,motion_end=terminate_episode'."
     ),

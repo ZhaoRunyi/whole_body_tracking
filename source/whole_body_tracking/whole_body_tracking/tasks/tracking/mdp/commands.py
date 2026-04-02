@@ -34,6 +34,12 @@ SAMPLING_PRESET_DEFAULTS = {
         "phase_sampling_strategy": "adaptive_legacy",
         "motion_end_behavior": "rollover_resample",
     },
+    "beyondmimic_adaptive": {
+        "motion_resample_scope": "episode_reset_and_rollover",
+        "phase_sampling_window": "full_motion",
+        "phase_sampling_strategy": "adaptive_per_motion",
+        "motion_end_behavior": "rollover_resample",
+    },
     "hover": {
         "motion_resample_scope": "episode_reset_only",
         "phase_sampling_window": "truncate_to_episode",
