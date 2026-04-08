@@ -122,6 +122,19 @@ python scripts/rsl_rl/play.py --task=Tracking-Flat-G1-v0 --num_envs=2 --wandb_pa
 The WandB run path can be located in the run overview. It follows the format {your_organization}/{project_name}/ along
 with a unique 8-character identifier. Note that run_name is different from run_path.
 
+- Multi-motion quantitative evaluation (single motion also supported) by the following command:
+
+```bash
+python scripts/rsl_rl/play.py --task=Tracking-Flat-G1-v0 --num_envs=256 \
+--wandb_path={wandb-run-path} --evaluate \
+--motion_files /path/to/motion_a.npz /path/to/motion_b.npz \
+--eval_episodes_per_motion 20
+```
+
+You can also pass `--motion_dir /path/to/motions` to recursively evaluate all `*.npz`.
+Evaluation results are saved as JSON and CSV under `<run_dir>/eval` (or `--eval_output_dir`), with metrics grouped by
+motion name.
+
 ## Code Structure
 
 Below is an overview of the code structure for this repository:
