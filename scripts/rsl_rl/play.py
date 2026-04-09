@@ -21,6 +21,7 @@ parser.add_argument(
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment (aligned with train.py).")
 parser.add_argument(
     "--sampling_strategy",
     type=str,
@@ -508,6 +509,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     """Play or evaluate with RSL-RL agent."""
     agent_cfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    env_cfg.seed = agent_cfg.seed
 
     explicit_motion_files, registry_names = _resolve_explicit_motion_selection()
     artifact_motion_files: list[str] = []
