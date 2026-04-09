@@ -160,11 +160,9 @@ def _force_motion_frame(base_env, motion_command, env_ids, time_step: int = 0) -
     clamped_time_step = max(int(time_step), 0)
     max_time_steps = torch.clamp(motion_command.motion_lengths[motion_command.motion_ids[env_ids_tensor]] - 1, min=0)
     motion_command.motion_ended[env_ids_tensor] = False
-    motion_command.time_steps[env_ids_tensor] = torch.clamp(
-        torch.full_like(env_ids_tensor, clamped_time_step),
-        min=0,
-        max=max_time_steps,
-    )
+    target_steps = torch.full_like(env_ids_tensor, clamped_time_step)
+    target_steps = torch.minimum(target_steps, max_time_steps)
+    motion_command.time_steps[env_ids_tensor] = target_steps
     motion_command._refresh_motion_buffers(env_ids_tensor)
 
     root_pos = motion_command.body_pos_w[:, 0].clone()

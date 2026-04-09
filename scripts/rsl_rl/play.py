@@ -105,6 +105,12 @@ parser.add_argument(
     default=True,
     help="When enabled, each evaluation episode starts from frame 0 of the motion and runs the whole motion.",
 )
+parser.add_argument(
+    "--export_onnx",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Export policy ONNX during play/eval. Disable if ONNX export fails in your environment.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -429,7 +435,8 @@ def _run_grouped_evaluation(
     env = _create_wrapped_env(env_cfg, log_dir=log_dir, video_enabled=False)
     try:
         ppo_runner, policy = _load_runner_and_policy(env, agent_cfg, resume_path)
-        _export_policy_artifacts(env, ppo_runner, resume_path)
+        if args_cli.export_onnx:
+            _export_policy_artifacts(env, ppo_runner, resume_path)
         return evaluate_multi_motion_policy(
             env=env,
             policy=policy,
@@ -460,7 +467,7 @@ def _run_separate_motion_evaluation(
         env = _create_wrapped_env(env_cfg, log_dir=log_dir, video_enabled=False)
         try:
             ppo_runner, policy = _load_runner_and_policy(env, agent_cfg, resume_path)
-            if not exported:
+            if not exported and args_cli.export_onnx:
                 _export_policy_artifacts(env, ppo_runner, resume_path)
                 exported = True
             motion_result = evaluate_multi_motion_policy(
@@ -593,7 +600,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = _create_wrapped_env(env_cfg, log_dir=log_dir, video_enabled=video_enabled)
         try:
             ppo_runner, policy = _load_runner_and_policy(env, agent_cfg, resume_path)
-            _export_policy_artifacts(env, ppo_runner, resume_path)
+            if args_cli.export_onnx:
+                _export_policy_artifacts(env, ppo_runner, resume_path)
 
             obs, _ = env.get_observations()
             timestep = 0
