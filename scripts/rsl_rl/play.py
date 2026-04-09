@@ -573,7 +573,7 @@ def _run_separate_motion_evaluation_reuse(
             "stop_reason": "targets_reached" if all_targets_reached else "partial_completion",
             "all_targets_reached": all_targets_reached,
             "expected_episode_length_steps": None,
-            "eval_mode": "separate_reuse",
+            "eval_mode": "separate",
         },
         "motions": combined_rows,
     }
@@ -653,7 +653,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     if args_cli.evaluate:
         if args_cli.eval_mode == "separate":
-            result = _run_separate_motion_evaluation(env_cfg, agent_cfg, resume_path, log_dir)
+            result = _run_separate_motion_evaluation_reuse(env_cfg, agent_cfg, resume_path, log_dir)
         else:
             result = _run_grouped_evaluation(env_cfg, agent_cfg, resume_path, log_dir)
         result.setdefault("config", {})
