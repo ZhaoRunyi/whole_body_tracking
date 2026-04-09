@@ -23,6 +23,12 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment (aligned with train.py).")
 parser.add_argument(
+    "--render_refpose",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Render motion reference poses during play/eval when not running headless.",
+)
+parser.add_argument(
     "--sampling_strategy",
     type=str,
     default=None,
@@ -96,9 +102,13 @@ parser.add_argument(
 parser.add_argument(
     "--eval_mode",
     type=str,
-    choices=("grouped", "separate"),
-    default="separate",
-    help="`grouped` aggregates multi-motion evaluation in one env; `separate` evaluates each motion independently.",
+    choices=("grouped", "separate", "separate_reuse"),
+    default="separate_reuse",
+    help=(
+        "`grouped` aggregates multi-motion evaluation in one env; "
+        "`separate` evaluates each motion independently (fresh env per motion); "
+        "`separate_reuse` evaluates each motion independently while reusing one env."
+    ),
 )
 parser.add_argument(
     "--eval_full_motion",
@@ -363,6 +373,18 @@ def _configure_motion_sampling_for_evaluation(
     motion_cfg.motion_end_behavior = "terminate_episode"
 
 
+def _configure_play_visualization(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, render_refpose: bool
+) -> None:
+    motion_cfg = getattr(getattr(env_cfg, "commands", None), "motion", None)
+    if motion_cfg is not None:
+        motion_cfg.debug_vis = render_refpose and not bool(getattr(args_cli, "headless", False))
+
+    contact_sensor_cfg = getattr(getattr(env_cfg, "scene", None), "contact_forces", None)
+    if contact_sensor_cfg is not None:
+        contact_sensor_cfg.debug_vis = False
+
+
 def _create_wrapped_env(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     log_dir: str,
@@ -504,12 +526,66 @@ def _run_separate_motion_evaluation(
     }
 
 
+def _run_separate_motion_evaluation_reuse(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    agent_cfg: RslRlOnPolicyRunnerCfg,
+    resume_path: str,
+    log_dir: str,
+) -> dict:
+    motion_files = _get_motion_file_list_from_cfg(env_cfg)
+    combined_rows: list[dict] = []
+    total_steps = 0
+    all_targets_reached = True
+
+    env = _create_wrapped_env(env_cfg, log_dir=log_dir, video_enabled=False)
+    try:
+        ppo_runner, policy = _load_runner_and_policy(env, agent_cfg, resume_path)
+        if args_cli.export_onnx:
+            _export_policy_artifacts(env, ppo_runner, resume_path)
+
+        for motion_id, motion_file in enumerate(motion_files):
+            motion_result = evaluate_multi_motion_policy(
+                env=env,
+                policy=policy,
+                simulation_app=simulation_app,
+                target_episodes_per_motion=args_cli.eval_episodes_per_motion,
+                max_steps=args_cli.eval_max_steps,
+                print_interval=args_cli.eval_print_interval,
+                force_full_motion_from_start=args_cli.eval_full_motion,
+                pinned_motion_id=motion_id,
+                reset_env=True,
+            )
+
+            total_steps += int(motion_result.get("summary", {}).get("total_steps", 0))
+            all_targets_reached = all_targets_reached and bool(
+                motion_result.get("summary", {}).get("all_targets_reached", False)
+            )
+            if motion_result.get("motions") and motion_id < len(motion_result["motions"]):
+                row = dict(motion_result["motions"][motion_id])
+                row["motion_file"] = motion_file
+                combined_rows.append(row)
+    finally:
+        env.close()
+
+    return {
+        "summary": {
+            "total_steps": total_steps,
+            "stop_reason": "targets_reached" if all_targets_reached else "partial_completion",
+            "all_targets_reached": all_targets_reached,
+            "expected_episode_length_steps": None,
+            "eval_mode": "separate_reuse",
+        },
+        "motions": combined_rows,
+    }
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Play or evaluate with RSL-RL agent."""
     agent_cfg = cli_args.parse_rsl_rl_cfg(args_cli.task, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.seed = agent_cfg.seed
+    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
     explicit_motion_files, registry_names = _resolve_explicit_motion_selection()
     artifact_motion_files: list[str] = []
@@ -566,6 +642,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             _apply_sampling_strategy(env_cfg, args_cli.sampling_strategy)
     elif args_cli.sampling_strategy:
         _apply_sampling_strategy(env_cfg, args_cli.sampling_strategy)
+    _configure_play_visualization(env_cfg, args_cli.render_refpose)
 
     video_enabled = bool(args_cli.video)
     if args_cli.evaluate and video_enabled:

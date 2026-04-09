@@ -187,6 +187,24 @@ def _force_motion_frame(base_env, motion_command, env_ids, time_step: int = 0) -
     )
 
 
+def _pin_motion_id(motion_command, motion_id: int) -> torch.Tensor:
+    original_motion_prob = motion_command.motion_prob.clone()
+    pinned_prob = torch.zeros_like(motion_command.motion_prob)
+    pinned_prob[int(motion_id)] = 1.0
+    motion_command.motion_prob = pinned_prob
+    motion_command.motion_ids[:] = int(motion_id)
+    return original_motion_prob
+
+
+def _reset_env_if_possible(env) -> None:
+    reset_fn = getattr(env, "reset", None)
+    if reset_fn is None:
+        return
+    reset_output = reset_fn()
+    if isinstance(reset_output, tuple):
+        return
+
+
 def _collect_step_metrics(
     motion_command,
     actions: torch.Tensor,
@@ -316,6 +334,8 @@ def evaluate_multi_motion_policy(
     max_steps: int | None = None,
     print_interval: int = 200,
     force_full_motion_from_start: bool = False,
+    pinned_motion_id: int | None = None,
+    reset_env: bool = True,
 ) -> dict[str, Any]:
     if target_episodes_per_motion <= 0:
         raise ValueError("target_episodes_per_motion must be > 0.")
@@ -339,6 +359,13 @@ def evaluate_multi_motion_policy(
     num_envs = int(env.num_envs)
     device = motion_command.motion_ids.device
     all_env_ids = torch.arange(num_envs, device=device, dtype=torch.long)
+
+    original_motion_prob = None
+    if pinned_motion_id is not None:
+        original_motion_prob = _pin_motion_id(motion_command, pinned_motion_id)
+
+    if reset_env:
+        _reset_env_if_possible(env)
 
     if force_full_motion_from_start:
         _force_motion_frame(base_env, motion_command, all_env_ids, time_step=0)
@@ -418,6 +445,8 @@ def evaluate_multi_motion_policy(
                 metric_accumulator[done_env_ids] = 0.0
 
             if force_full_motion_from_start:
+                if pinned_motion_id is not None:
+                    motion_command.motion_ids[done_env_ids] = int(pinned_motion_id)
                 _force_motion_frame(base_env, motion_command, done_env_ids, time_step=0)
                 obs, _ = env.get_observations()
 
@@ -440,8 +469,11 @@ def evaluate_multi_motion_policy(
         "max_steps": max_steps,
         "print_interval": int(print_interval),
         "force_full_motion_from_start": bool(force_full_motion_from_start),
+        "pinned_motion_id": pinned_motion_id,
         "motion_files": [os.path.abspath(path) for path in motion_files],
     }
+    if original_motion_prob is not None:
+        motion_command.motion_prob = original_motion_prob
     return result
 
 
