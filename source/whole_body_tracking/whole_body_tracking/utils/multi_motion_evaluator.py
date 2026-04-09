@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 from typing import Any
 
+import isaaclab.utils.math as math_utils
 import torch
 
 
@@ -25,6 +26,14 @@ TRACKING_METRIC_KEYS = (
 TIMEOUT_INFO_KEYS = ("time_outs", "time_out", "timeouts")
 JOINT_EFFORT_ATTR_KEYS = ("applied_torque", "computed_torque", "joint_torque", "joint_torques", "applied_joint_efforts")
 CONTACT_FORCE_ATTR_KEYS = ("net_forces_w", "net_forces_world", "net_forces_w_history")
+SUCCESS_REASON_KEYS = ("motion_end", "time_out")
+PRIMARY_TERMINATION_REASON_ORDER = ("motion_end", "time_out", "anchor_pos", "anchor_ori", "ee_body_pos", "terminated")
+DEFAULT_EE_BODY_NAMES = (
+    "left_ankle_roll_link",
+    "right_ankle_roll_link",
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link",
+)
 
 
 def make_motion_labels(motion_files: list[str]) -> list[str]:
@@ -90,6 +99,81 @@ def _extract_time_out_mask(info: Any, num_envs: int, device: torch.device) -> to
         if key in info:
             return _to_bool_mask(info[key], num_envs, device)
     return torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+
+def _get_termination_param(base_env, term_name: str, param_name: str, default: Any) -> Any:
+    cfg = getattr(base_env, "cfg", None)
+    terminations_cfg = getattr(cfg, "terminations", None) if cfg is not None else None
+    term_cfg = getattr(terminations_cfg, term_name, None) if terminations_cfg is not None else None
+    params = getattr(term_cfg, "params", None)
+    if isinstance(params, dict) and param_name in params:
+        return params[param_name]
+    return default
+
+
+def _get_body_indexes(motion_command, body_names: list[str] | tuple[str, ...] | None) -> list[int]:
+    if body_names is None:
+        return list(range(len(motion_command.cfg.body_names)))
+    selected = set(body_names)
+    return [idx for idx, name in enumerate(motion_command.cfg.body_names) if name in selected]
+
+
+def _classify_episode_outcomes(base_env, motion_command, timeout_mask: torch.Tensor, done_env_ids: torch.Tensor) -> list[dict[str, Any]]:
+    num_envs = int(motion_command.motion_ids.shape[0])
+    device = motion_command.motion_ids.device
+
+    motion_end_mask = motion_command.motion_ended.clone()
+
+    anchor_pos_threshold = float(_get_termination_param(base_env, "anchor_pos", "threshold", 0.25))
+    anchor_pos_mask = (
+        torch.abs(motion_command.anchor_pos_w[:, -1] - motion_command.robot_anchor_pos_w[:, -1]) > anchor_pos_threshold
+    )
+
+    anchor_ori_threshold = float(_get_termination_param(base_env, "anchor_ori", "threshold", 0.8))
+    robot = base_env.scene["robot"]
+    motion_projected_gravity_b = math_utils.quat_rotate_inverse(motion_command.anchor_quat_w, robot.data.GRAVITY_VEC_W)
+    robot_projected_gravity_b = math_utils.quat_rotate_inverse(
+        motion_command.robot_anchor_quat_w, robot.data.GRAVITY_VEC_W
+    )
+    anchor_ori_mask = (motion_projected_gravity_b[:, 2] - robot_projected_gravity_b[:, 2]).abs() > anchor_ori_threshold
+
+    ee_body_threshold = float(_get_termination_param(base_env, "ee_body_pos", "threshold", 0.25))
+    ee_body_names = _get_termination_param(base_env, "ee_body_pos", "body_names", DEFAULT_EE_BODY_NAMES)
+    ee_body_indexes = _get_body_indexes(motion_command, ee_body_names)
+    if ee_body_indexes:
+        ee_body_error = torch.abs(
+            motion_command.body_pos_relative_w[:, ee_body_indexes, -1] - motion_command.robot_body_pos_w[:, ee_body_indexes, -1]
+        )
+        ee_body_pos_mask = torch.any(ee_body_error > ee_body_threshold, dim=-1)
+    else:
+        ee_body_pos_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+    reason_masks = {
+        "motion_end": motion_end_mask,
+        "time_out": timeout_mask,
+        "anchor_pos": anchor_pos_mask,
+        "anchor_ori": anchor_ori_mask,
+        "ee_body_pos": ee_body_pos_mask,
+    }
+
+    outcomes: list[dict[str, Any]] = []
+    for env_id_tensor in done_env_ids:
+        env_id = int(env_id_tensor.item())
+        reason = "terminated"
+        for candidate in PRIMARY_TERMINATION_REASON_ORDER:
+            if candidate == "terminated":
+                continue
+            candidate_mask = reason_masks.get(candidate)
+            if candidate_mask is not None and bool(candidate_mask[env_id].item()):
+                reason = candidate
+                break
+        outcomes.append(
+            {
+                "success": reason in SUCCESS_REASON_KEYS,
+                "termination_reason": reason,
+            }
+        )
+    return outcomes
 
 
 def _per_env_l2_norm(values: torch.Tensor) -> torch.Tensor:
@@ -249,10 +333,12 @@ class _MotionEpisodeAggregator:
         self.expected_episode_length_steps = expected_episode_length_steps
 
         self.episode_count = [0 for _ in range(self.num_motions)]
+        self.success_count = [0 for _ in range(self.num_motions)]
         self.timeout_count = [0 for _ in range(self.num_motions)]
         self.episode_return_sum = [0.0 for _ in range(self.num_motions)]
         self.episode_length_sum = [0.0 for _ in range(self.num_motions)]
         self.metric_sum_by_name: dict[str, list[float]] = {}
+        self.termination_reason_count_by_name: dict[str, list[int]] = {}
 
     def add_episode(
         self,
@@ -260,21 +346,31 @@ class _MotionEpisodeAggregator:
         episode_return: float,
         episode_length: int,
         timed_out: bool,
+        success: bool,
+        termination_reason: str,
         mean_metrics: dict[str, float],
-    ) -> None:
+    ) -> int | None:
         if motion_id < 0 or motion_id >= self.num_motions:
-            return
+            return None
+        if self.episode_count[motion_id] >= self.target_episodes_per_motion:
+            return None
 
         self.episode_count[motion_id] += 1
+        if success:
+            self.success_count[motion_id] += 1
         if timed_out:
             self.timeout_count[motion_id] += 1
         self.episode_return_sum[motion_id] += float(episode_return)
         self.episode_length_sum[motion_id] += float(episode_length)
+        if termination_reason not in self.termination_reason_count_by_name:
+            self.termination_reason_count_by_name[termination_reason] = [0 for _ in range(self.num_motions)]
+        self.termination_reason_count_by_name[termination_reason][motion_id] += 1
 
         for metric_name, metric_value in mean_metrics.items():
             if metric_name not in self.metric_sum_by_name:
                 self.metric_sum_by_name[metric_name] = [0.0 for _ in range(self.num_motions)]
             self.metric_sum_by_name[metric_name][motion_id] += float(metric_value)
+        return self.episode_count[motion_id]
 
     def is_target_reached(self) -> bool:
         return all(count >= self.target_episodes_per_motion for count in self.episode_count)
@@ -289,8 +385,9 @@ class _MotionEpisodeAggregator:
         rows: list[dict[str, Any]] = []
         for motion_id, motion_name in enumerate(self.motion_labels):
             episode_count = self.episode_count[motion_id]
+            success_count = self.success_count[motion_id]
             timeout_count = self.timeout_count[motion_id]
-            early_termination_count = episode_count - timeout_count
+            early_termination_count = episode_count - success_count
 
             row: dict[str, Any] = {
                 "motion_name": motion_name,
@@ -299,6 +396,10 @@ class _MotionEpisodeAggregator:
                 "coverage": (episode_count / self.target_episodes_per_motion)
                 if self.target_episodes_per_motion > 0
                 else None,
+                "successful_episodes": success_count,
+                "failed_episodes": early_termination_count,
+                "success_rate": (success_count / episode_count) if episode_count > 0 else None,
+                "failure_rate": (early_termination_count / episode_count) if episode_count > 0 else None,
                 "timeout_rate": (timeout_count / episode_count) if episode_count > 0 else None,
                 "early_termination_rate": (early_termination_count / episode_count) if episode_count > 0 else None,
                 "mean_episode_return": (self.episode_return_sum[motion_id] / episode_count) if episode_count > 0 else None,
@@ -313,6 +414,9 @@ class _MotionEpisodeAggregator:
 
             for metric_name, metric_sums in sorted(self.metric_sum_by_name.items()):
                 row[f"mean_{metric_name}"] = (metric_sums[motion_id] / episode_count) if episode_count > 0 else None
+            for reason_name, reason_counts in sorted(self.termination_reason_count_by_name.items()):
+                row[f"count_{reason_name}"] = reason_counts[motion_id]
+                row[f"rate_{reason_name}"] = (reason_counts[motion_id] / episode_count) if episode_count > 0 else None
             rows.append(row)
 
         return {
@@ -336,6 +440,7 @@ def evaluate_multi_motion_policy(
     force_full_motion_from_start: bool = False,
     pinned_motion_id: int | None = None,
     reset_env: bool = True,
+    episode_callback=None,
 ) -> dict[str, Any]:
     if target_episodes_per_motion <= 0:
         raise ValueError("target_episodes_per_motion must be > 0.")
@@ -344,14 +449,20 @@ def evaluate_multi_motion_policy(
 
     base_env = getattr(env, "unwrapped", env)
     motion_command = base_env.command_manager.get_term("motion")
-    motion_files = list(motion_command.motion_files)
-    if not motion_files:
+    all_motion_files = list(motion_command.motion_files)
+    if not all_motion_files:
         raise ValueError("No motion files are configured in env.commands.motion.motion_file.")
-    motion_labels = make_motion_labels(motion_files)
+    all_motion_labels = make_motion_labels(all_motion_files)
+    if pinned_motion_id is None:
+        tracked_motion_ids = list(range(len(all_motion_files)))
+    else:
+        tracked_motion_ids = [int(pinned_motion_id)]
+    tracked_motion_labels = [all_motion_labels[motion_id] for motion_id in tracked_motion_ids]
+    tracked_motion_index = {motion_id: local_idx for local_idx, motion_id in enumerate(tracked_motion_ids)}
 
     expected_episode_length_steps = _resolve_expected_episode_length_steps(base_env)
     aggregator = _MotionEpisodeAggregator(
-        motion_labels=motion_labels,
+        motion_labels=tracked_motion_labels,
         target_episodes_per_motion=target_episodes_per_motion,
         expected_episode_length_steps=expected_episode_length_steps,
     )
@@ -386,6 +497,7 @@ def evaluate_multi_motion_policy(
     episode_length = torch.zeros(num_envs, dtype=torch.long, device=device)
     episode_metric_sums: dict[str, torch.Tensor] = {}
     previous_actions = None
+    episode_rows: list[dict[str, Any]] = []
 
     total_steps = 0
     stop_reason = "simulation_stopped"
@@ -420,6 +532,7 @@ def evaluate_multi_motion_policy(
             done_returns = episode_return[done_env_ids].detach().cpu().tolist()
             done_lengths = episode_length[done_env_ids].detach().cpu().tolist()
             done_timeouts = timeout_mask[done_env_ids].detach().cpu().tolist()
+            done_outcomes = _classify_episode_outcomes(base_env, motion_command, timeout_mask, done_env_ids)
 
             metric_means_by_env: list[dict[str, float]] = []
             for local_idx, env_id_tensor in enumerate(done_env_ids):
@@ -431,13 +544,49 @@ def evaluate_multi_motion_policy(
                 metric_means_by_env.append(mean_metrics)
 
             for local_idx, motion_id in enumerate(done_motion_ids):
-                aggregator.add_episode(
-                    motion_id=int(motion_id),
+                if int(motion_id) not in tracked_motion_index:
+                    continue
+                local_motion_id = tracked_motion_index[int(motion_id)]
+                outcome = done_outcomes[local_idx]
+                episode_number = aggregator.add_episode(
+                    motion_id=tracked_motion_index[int(motion_id)],
                     episode_return=float(done_returns[local_idx]),
                     episode_length=int(done_lengths[local_idx]),
                     timed_out=bool(done_timeouts[local_idx]),
+                    success=bool(outcome["success"]),
+                    termination_reason=str(outcome["termination_reason"]),
                     mean_metrics=metric_means_by_env[local_idx],
                 )
+                if episode_number is None:
+                    continue
+                episode_length_ratio = None
+                if expected_episode_length_steps is not None and expected_episode_length_steps > 0:
+                    episode_length_ratio = float(done_lengths[local_idx]) / float(expected_episode_length_steps)
+                episode_row = {
+                    "global_episode_index": len(episode_rows) + 1,
+                    "motion_name": all_motion_labels[int(motion_id)],
+                    "motion_file": os.path.abspath(all_motion_files[int(motion_id)]),
+                    "motion_id": int(motion_id),
+                    "episode_index_for_motion": int(episode_number),
+                    "success": bool(outcome["success"]),
+                    "termination_reason": str(outcome["termination_reason"]),
+                    "episode_return": float(done_returns[local_idx]),
+                    "episode_length_steps": int(done_lengths[local_idx]),
+                    "episode_length_ratio": episode_length_ratio,
+                }
+                episode_rows.append(episode_row)
+                status = "SUCCESS" if episode_row["success"] else "FAIL"
+                print(
+                    "[EVAL][EP] "
+                    f"motion={episode_row['motion_name']} "
+                    f"episode={episode_row['episode_index_for_motion']}/{target_episodes_per_motion} "
+                    f"status={status} "
+                    f"reason={episode_row['termination_reason']} "
+                    f"length_steps={episode_row['episode_length_steps']} "
+                    f"return={episode_row['episode_return']:.4f}"
+                )
+                if episode_callback is not None:
+                    episode_callback(episode_row)
 
             episode_return[done_env_ids] = 0.0
             episode_length[done_env_ids] = 0
@@ -464,13 +613,15 @@ def evaluate_multi_motion_policy(
             break
 
     result = aggregator.build_summary(total_steps=total_steps, stop_reason=stop_reason)
+    result["episodes"] = episode_rows
     result["config"] = {
         "target_episodes_per_motion": int(target_episodes_per_motion),
         "max_steps": max_steps,
         "print_interval": int(print_interval),
         "force_full_motion_from_start": bool(force_full_motion_from_start),
         "pinned_motion_id": pinned_motion_id,
-        "motion_files": [os.path.abspath(path) for path in motion_files],
+        "tracked_motion_ids": tracked_motion_ids,
+        "motion_files": [os.path.abspath(all_motion_files[motion_id]) for motion_id in tracked_motion_ids],
     }
     if original_motion_prob is not None:
         motion_command.motion_prob = original_motion_prob
@@ -479,11 +630,12 @@ def evaluate_multi_motion_policy(
 
 def save_multi_motion_summary(
     result: dict[str, Any], output_dir: str, prefix: str = "multi_motion_eval"
-) -> tuple[str, str]:
+) -> tuple[str, str, str | None]:
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     json_path = os.path.join(output_dir, f"{prefix}_{timestamp}.json")
     csv_path = os.path.join(output_dir, f"{prefix}_{timestamp}.csv")
+    episode_csv_path = None
 
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, sort_keys=True)
@@ -494,6 +646,10 @@ def save_multi_motion_summary(
         "episodes",
         "target_episodes",
         "coverage",
+        "successful_episodes",
+        "failed_episodes",
+        "success_rate",
+        "failure_rate",
         "timeout_rate",
         "early_termination_rate",
         "mean_episode_return",
@@ -512,4 +668,29 @@ def save_multi_motion_summary(
         for row in rows:
             writer.writerow(row)
 
-    return json_path, csv_path
+    episode_rows = result.get("episodes", [])
+    if episode_rows:
+        episode_csv_path = os.path.join(output_dir, f"{prefix}_episodes_{timestamp}.csv")
+        episode_keys = [
+            "global_episode_index",
+            "motion_name",
+            "motion_file",
+            "motion_id",
+            "episode_index_for_motion",
+            "success",
+            "termination_reason",
+            "episode_return",
+            "episode_length_steps",
+            "episode_length_ratio",
+        ]
+        for row in episode_rows:
+            for key in row:
+                if key not in episode_keys:
+                    episode_keys.append(key)
+        with open(episode_csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=episode_keys)
+            writer.writeheader()
+            for row in episode_rows:
+                writer.writerow(row)
+
+    return json_path, csv_path, episode_csv_path

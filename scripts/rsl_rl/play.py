@@ -5,7 +5,9 @@
 import argparse
 import os
 import pathlib
+import re
 import sys
+from datetime import datetime
 
 from isaaclab.app import AppLauncher
 
@@ -14,7 +16,7 @@ import cli_args  # isort: skip
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Play or evaluate an RL agent with RSL-RL.")
-parser.add_argument("--video", action="store_true", default=False, help="Record videos during play mode.")
+parser.add_argument("--video", action="store_true", default=False, help="Record videos during play or evaluation.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
@@ -94,20 +96,14 @@ parser.add_argument(
     help="Progress print interval (steps) in evaluation mode.",
 )
 parser.add_argument(
-    "--eval_output_dir",
-    type=str,
-    default=None,
-    help="Directory for saving evaluation CSV/JSON (default: <run_dir>/eval).",
-)
-parser.add_argument(
     "--eval_mode",
     type=str,
     choices=("grouped", "separate", "separate_reuse"),
     default="separate_reuse",
     help=(
         "`grouped` aggregates multi-motion evaluation in one env; "
-        "`separate` evaluates each motion independently (fresh env per motion); "
-        "`separate_reuse` evaluates each motion independently while reusing one env."
+        "`separate` evaluates each motion independently while reusing one env; "
+        "`separate_reuse` is a backward-compatible alias of `separate`."
     ),
 )
 parser.add_argument(
@@ -389,16 +385,30 @@ def _create_wrapped_env(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     log_dir: str,
     video_enabled: bool,
+    video_mode: str = "play",
+    eval_artifact_dir: str | None = None,
 ):
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if video_enabled else None)
     if video_enabled:
-        video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "play"),
-            "step_trigger": lambda step: step == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        print("[INFO] Recording videos during play.")
+        if video_mode == "eval":
+            if eval_artifact_dir is None:
+                raise ValueError("eval_artifact_dir must be provided when recording evaluation videos.")
+            video_kwargs = {
+                "video_folder": os.path.join(eval_artifact_dir, "videos"),
+                "episode_trigger": lambda episode_id: True,
+                "video_length": 0,
+                "name_prefix": "eval",
+                "disable_logger": True,
+            }
+            print("[INFO] Recording full-episode evaluation videos.")
+        else:
+            video_kwargs = {
+                "video_folder": os.path.join(log_dir, "videos", "play"),
+                "step_trigger": lambda step: step == 0,
+                "video_length": args_cli.video_length,
+                "disable_logger": True,
+            }
+            print("[INFO] Recording videos during play.")
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
@@ -406,6 +416,58 @@ def _create_wrapped_env(
         env = multi_agent_to_single_agent(env)
 
     return RslRlVecEnvWrapper(env)
+
+
+def _unwrap_record_video(env):
+    current = env
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if hasattr(current, "video_folder") and hasattr(current, "episode_id") and hasattr(current, "name_prefix"):
+            return current
+        current = getattr(current, "env", None)
+    return None
+
+
+def _sanitize_video_stem(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    sanitized = sanitized.strip("._-")
+    return sanitized or "episode"
+
+
+def _build_eval_video_renamer(env):
+    record_video = _unwrap_record_video(env)
+    if record_video is None:
+        return None
+
+    def _rename_episode_video(episode_row: dict) -> None:
+        if not bool(args_cli.video):
+            return
+
+        completed_episode_id = int(getattr(record_video, "episode_id", 0)) - 1
+        if completed_episode_id < 0:
+            return
+
+        video_folder = pathlib.Path(record_video.video_folder)
+        source_path = video_folder / f"{record_video.name_prefix}-episode-{completed_episode_id}.mp4"
+        if not source_path.exists():
+            return
+
+        motion_name = _sanitize_video_stem(str(episode_row.get("motion_name", "motion")))
+        episode_idx = int(episode_row.get("episode_index_for_motion", 0))
+        status = "success" if bool(episode_row.get("success", False)) else "fail"
+        target_stem = f"{motion_name}_episode_{episode_idx:03d}_{status}"
+        target_path = video_folder / f"{target_stem}.mp4"
+
+        dedup_index = 1
+        while target_path.exists():
+            target_path = video_folder / f"{target_stem}_{dedup_index:02d}.mp4"
+            dedup_index += 1
+
+        source_path.rename(target_path)
+        episode_row["video_file"] = str(target_path.resolve())
+
+    return _rename_episode_video
 
 
 def _load_runner_and_policy(env, agent_cfg: RslRlOnPolicyRunnerCfg, resume_path: str):
@@ -440,13 +502,22 @@ def _print_evaluation_summary(result: dict) -> None:
         motion_name = row.get("motion_name")
         episodes = row.get("episodes")
         target_episodes = row.get("target_episodes")
+        success_rate = row.get("success_rate")
         episode_return = row.get("mean_episode_return")
         anchor_err = row.get("mean_error_anchor_pos")
         body_err = row.get("mean_error_body_pos")
         print(
             f"[INFO]   {motion_name}: episodes={episodes}/{target_episodes}, "
-            f"return={episode_return}, anchor_pos_err={anchor_err}, body_pos_err={body_err}"
+            f"success_rate={success_rate}, return={episode_return}, "
+            f"anchor_pos_err={anchor_err}, body_pos_err={body_err}"
         )
+
+
+def _make_eval_artifact_dir(log_dir: str) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    eval_artifact_dir = os.path.join(log_dir, "eval", timestamp)
+    os.makedirs(eval_artifact_dir, exist_ok=True)
+    return eval_artifact_dir
 
 
 def _run_grouped_evaluation(
@@ -454,12 +525,20 @@ def _run_grouped_evaluation(
     agent_cfg: RslRlOnPolicyRunnerCfg,
     resume_path: str,
     log_dir: str,
+    eval_artifact_dir: str,
 ) -> dict:
-    env = _create_wrapped_env(env_cfg, log_dir=log_dir, video_enabled=False)
+    env = _create_wrapped_env(
+        env_cfg,
+        log_dir=log_dir,
+        video_enabled=bool(args_cli.video),
+        video_mode="eval",
+        eval_artifact_dir=eval_artifact_dir,
+    )
     try:
         ppo_runner, policy = _load_runner_and_policy(env, agent_cfg, resume_path)
         if args_cli.export_onnx:
             _export_policy_artifacts(env, ppo_runner, resume_path)
+        episode_video_callback = _build_eval_video_renamer(env)
         return evaluate_multi_motion_policy(
             env=env,
             policy=policy,
@@ -468,6 +547,7 @@ def _run_grouped_evaluation(
             max_steps=args_cli.eval_max_steps,
             print_interval=args_cli.eval_print_interval,
             force_full_motion_from_start=args_cli.eval_full_motion,
+            episode_callback=episode_video_callback,
         )
     finally:
         env.close()
@@ -478,6 +558,7 @@ def _run_separate_motion_evaluation(
     agent_cfg: RslRlOnPolicyRunnerCfg,
     resume_path: str,
     log_dir: str,
+    eval_artifact_dir: str,
 ) -> dict:
     motion_files = _get_motion_file_list_from_cfg(env_cfg)
     combined_rows: list[dict] = []
@@ -487,12 +568,19 @@ def _run_separate_motion_evaluation(
 
     for motion_file in motion_files:
         env_cfg.commands.motion.motion_file = motion_file
-        env = _create_wrapped_env(env_cfg, log_dir=log_dir, video_enabled=False)
+        env = _create_wrapped_env(
+            env_cfg,
+            log_dir=log_dir,
+            video_enabled=bool(args_cli.video),
+            video_mode="eval",
+            eval_artifact_dir=eval_artifact_dir,
+        )
         try:
             ppo_runner, policy = _load_runner_and_policy(env, agent_cfg, resume_path)
             if not exported and args_cli.export_onnx:
                 _export_policy_artifacts(env, ppo_runner, resume_path)
                 exported = True
+            episode_video_callback = _build_eval_video_renamer(env)
             motion_result = evaluate_multi_motion_policy(
                 env=env,
                 policy=policy,
@@ -501,6 +589,7 @@ def _run_separate_motion_evaluation(
                 max_steps=args_cli.eval_max_steps,
                 print_interval=args_cli.eval_print_interval,
                 force_full_motion_from_start=args_cli.eval_full_motion,
+                episode_callback=episode_video_callback,
             )
         finally:
             env.close()
@@ -531,17 +620,26 @@ def _run_separate_motion_evaluation_reuse(
     agent_cfg: RslRlOnPolicyRunnerCfg,
     resume_path: str,
     log_dir: str,
+    eval_artifact_dir: str,
 ) -> dict:
     motion_files = _get_motion_file_list_from_cfg(env_cfg)
     combined_rows: list[dict] = []
+    combined_episodes: list[dict] = []
     total_steps = 0
     all_targets_reached = True
 
-    env = _create_wrapped_env(env_cfg, log_dir=log_dir, video_enabled=False)
+    env = _create_wrapped_env(
+        env_cfg,
+        log_dir=log_dir,
+        video_enabled=bool(args_cli.video),
+        video_mode="eval",
+        eval_artifact_dir=eval_artifact_dir,
+    )
     try:
         ppo_runner, policy = _load_runner_and_policy(env, agent_cfg, resume_path)
         if args_cli.export_onnx:
             _export_policy_artifacts(env, ppo_runner, resume_path)
+        episode_video_callback = _build_eval_video_renamer(env)
 
         for motion_id, motion_file in enumerate(motion_files):
             motion_result = evaluate_multi_motion_policy(
@@ -554,20 +652,25 @@ def _run_separate_motion_evaluation_reuse(
                 force_full_motion_from_start=args_cli.eval_full_motion,
                 pinned_motion_id=motion_id,
                 reset_env=True,
+                episode_callback=episode_video_callback,
             )
 
             total_steps += int(motion_result.get("summary", {}).get("total_steps", 0))
             all_targets_reached = all_targets_reached and bool(
                 motion_result.get("summary", {}).get("all_targets_reached", False)
             )
-            if motion_result.get("motions") and motion_id < len(motion_result["motions"]):
-                row = dict(motion_result["motions"][motion_id])
+            if motion_result.get("motions"):
+                row = dict(motion_result["motions"][0])
                 row["motion_file"] = motion_file
                 combined_rows.append(row)
+            for episode_row in motion_result.get("episodes", []):
+                combined_episode_row = dict(episode_row)
+                combined_episode_row["global_episode_index"] = len(combined_episodes) + 1
+                combined_episodes.append(combined_episode_row)
     finally:
         env.close()
 
-    return {
+    result = {
         "summary": {
             "total_steps": total_steps,
             "stop_reason": "targets_reached" if all_targets_reached else "partial_completion",
@@ -577,6 +680,9 @@ def _run_separate_motion_evaluation_reuse(
         },
         "motions": combined_rows,
     }
+    if combined_episodes:
+        result["episodes"] = combined_episodes
+    return result
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -645,17 +751,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _configure_play_visualization(env_cfg, args_cli.render_refpose)
 
     video_enabled = bool(args_cli.video)
-    if args_cli.evaluate and video_enabled:
-        print("[WARN] --video is ignored in evaluation mode.")
-        video_enabled = False
+    if args_cli.evaluate and video_enabled and env_cfg.scene.num_envs != 1:
+        print(
+            "[WARN] Evaluation video captures the shared scene across environments. "
+            "Use --num_envs=1 if you want one clean per-episode video stream."
+        )
 
     log_dir = os.path.dirname(resume_path)
 
     if args_cli.evaluate:
-        if args_cli.eval_mode == "separate":
-            result = _run_separate_motion_evaluation_reuse(env_cfg, agent_cfg, resume_path, log_dir)
+        resolved_eval_mode = "separate" if args_cli.eval_mode in ("separate", "separate_reuse") else "grouped"
+        eval_artifact_dir = _make_eval_artifact_dir(log_dir)
+        if resolved_eval_mode == "separate":
+            result = _run_separate_motion_evaluation_reuse(
+                env_cfg, agent_cfg, resume_path, log_dir, eval_artifact_dir
+            )
         else:
-            result = _run_grouped_evaluation(env_cfg, agent_cfg, resume_path, log_dir)
+            result = _run_grouped_evaluation(env_cfg, agent_cfg, resume_path, log_dir, eval_artifact_dir)
         result.setdefault("config", {})
         result["config"].update(
             {
@@ -664,17 +776,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "wandb_path": args_cli.wandb_path,
                 "registry_name": registry_names,
                 "motion_files": configured_motion_files,
-                "eval_mode": args_cli.eval_mode,
+                "eval_mode": resolved_eval_mode,
                 "eval_full_motion": args_cli.eval_full_motion,
+                "eval_artifact_dir": str(pathlib.Path(eval_artifact_dir).resolve()),
             }
         )
 
-        eval_output_dir = args_cli.eval_output_dir if args_cli.eval_output_dir else os.path.join(log_dir, "eval")
-        eval_output_dir = str(pathlib.Path(eval_output_dir).expanduser().resolve())
-        json_path, csv_path = save_multi_motion_summary(result=result, output_dir=eval_output_dir)
+        json_path, csv_path, episode_csv_path = save_multi_motion_summary(result=result, output_dir=eval_artifact_dir)
         _print_evaluation_summary(result)
+        print(f"[INFO] Evaluation artifacts directory: {eval_artifact_dir}")
         print(f"[INFO] Saved evaluation JSON: {json_path}")
         print(f"[INFO] Saved evaluation CSV: {csv_path}")
+        if episode_csv_path is not None:
+            print(f"[INFO] Saved evaluation episode CSV: {episode_csv_path}")
     else:
         env = _create_wrapped_env(env_cfg, log_dir=log_dir, video_enabled=video_enabled)
         try:
