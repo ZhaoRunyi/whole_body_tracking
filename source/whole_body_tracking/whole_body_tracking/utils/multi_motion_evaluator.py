@@ -364,7 +364,7 @@ def evaluate_multi_motion_policy(
     stop_reason = "simulation_stopped"
 
     while simulation_app.is_running():
-        with torch.inference_mode():
+        with torch.no_grad():
             current_motion_ids = motion_command.motion_ids.clone()
             actions = policy(obs)
             step_metrics = _collect_step_metrics(motion_command, actions, previous_actions, robot, contact_sensor)
