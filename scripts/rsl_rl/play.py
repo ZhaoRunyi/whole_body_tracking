@@ -6,6 +6,8 @@ import argparse
 import os
 import pathlib
 import re
+import shutil
+import subprocess
 import sys
 from datetime import datetime
 
@@ -172,6 +174,8 @@ REQUIRED_MOTION_KEYS = (
 )
 
 _EVAL_VIDEO_RENAMERS = {}
+SHORT_EVAL_VIDEO_PAD_STEPS = 2
+SHORT_EVAL_VIDEO_TAIL_SECONDS = 2.0
 
 SAMPLING_STRATEGY_KEY_ALIASES = {
     "preset": "sampling_preset",
@@ -438,6 +442,48 @@ def _sanitize_video_stem(value: str) -> str:
     return sanitized or "episode"
 
 
+def _resolve_ffmpeg_executable() -> str | None:
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
+
+def _pad_short_eval_video(video_path: pathlib.Path, tail_seconds: float = SHORT_EVAL_VIDEO_TAIL_SECONDS) -> bool:
+    ffmpeg = _resolve_ffmpeg_executable()
+    if ffmpeg is None:
+        print(f"[WARN] Could not pad short eval video because ffmpeg was not found: {video_path}")
+        return False
+
+    tmp_path = video_path.with_name(f"{video_path.stem}.pad_tmp{video_path.suffix}")
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(video_path),
+        "-vf",
+        f"tpad=stop_mode=clone:stop_duration={float(tail_seconds):.3f}",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        str(tmp_path),
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if result.returncode != 0 or not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        stderr_tail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown ffmpeg error"
+        print(f"[WARN] Could not pad short eval video {video_path}: {stderr_tail}")
+        return False
+
+    tmp_path.replace(video_path)
+    return True
+
+
 class _EvalEpisodeVideoRenamer:
     def __init__(self, record_video_wrapper):
         self.record_video_wrapper = record_video_wrapper
@@ -467,6 +513,13 @@ class _EvalEpisodeVideoRenamer:
         if source_metadata_path.exists():
             source_metadata_path.rename(target_path.with_suffix(".meta.json"))
         episode_row["video_file"] = str(target_path.resolve())
+
+        episode_length_steps = int(episode_row.get("episode_length_steps", 0))
+        if 0 < episode_length_steps <= SHORT_EVAL_VIDEO_PAD_STEPS:
+            padded = _pad_short_eval_video(target_path)
+            episode_row["video_padded_for_viewing"] = padded
+            if padded:
+                episode_row["video_padding_tail_seconds"] = SHORT_EVAL_VIDEO_TAIL_SECONDS
 
 
 def _get_eval_episode_video_renamer(env):
