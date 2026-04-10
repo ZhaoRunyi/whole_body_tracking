@@ -171,6 +171,8 @@ REQUIRED_MOTION_KEYS = (
     "body_ang_vel_w",
 )
 
+_EVAL_VIDEO_RECORDERS = {}
+
 SAMPLING_STRATEGY_KEY_ALIASES = {
     "preset": "sampling_preset",
     "sampling_preset": "sampling_preset",
@@ -389,18 +391,14 @@ def _create_wrapped_env(
     eval_artifact_dir: str | None = None,
 ):
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if video_enabled else None)
+    eval_video_folder = None
     if video_enabled:
         if video_mode == "eval":
             if eval_artifact_dir is None:
                 raise ValueError("eval_artifact_dir must be provided when recording evaluation videos.")
-            video_kwargs = {
-                "video_folder": os.path.join(eval_artifact_dir, "videos"),
-                "episode_trigger": lambda episode_id: True,
-                "video_length": 0,
-                "name_prefix": "eval",
-                "disable_logger": True,
-            }
-            print("[INFO] Recording full-episode evaluation videos.")
+            eval_video_folder = os.path.join(eval_artifact_dir, "videos")
+            os.makedirs(eval_video_folder, exist_ok=True)
+            print(f"[INFO] Recording full-episode evaluation videos to: {eval_video_folder}")
         else:
             video_kwargs = {
                 "video_folder": os.path.join(log_dir, "videos", "play"),
@@ -409,24 +407,21 @@ def _create_wrapped_env(
                 "disable_logger": True,
             }
             print("[INFO] Recording videos during play.")
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+            print_dict(video_kwargs, nesting=4)
+            env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
-    return RslRlVecEnvWrapper(env)
-
-
-def _unwrap_record_video(env):
-    current = env
-    visited: set[int] = set()
-    while current is not None and id(current) not in visited:
-        visited.add(id(current))
-        if hasattr(current, "video_folder") and hasattr(current, "episode_id") and hasattr(current, "name_prefix"):
-            return current
-        current = getattr(current, "env", None)
-    return None
+    wrapped_env = RslRlVecEnvWrapper(env)
+    if eval_video_folder is not None:
+        recorder = _EvalEpisodeVideoRecorder(env, eval_video_folder)
+        _EVAL_VIDEO_RECORDERS[id(wrapped_env)] = recorder
+        try:
+            wrapped_env._eval_episode_video_recorder = recorder
+        except AttributeError:
+            pass
+    return wrapped_env
 
 
 def _sanitize_video_stem(value: str) -> str:
@@ -435,39 +430,74 @@ def _sanitize_video_stem(value: str) -> str:
     return sanitized or "episode"
 
 
-def _build_eval_video_renamer(env):
-    record_video = _unwrap_record_video(env)
-    if record_video is None:
-        return None
+def _resolve_eval_video_fps(render_env) -> int:
+    metadata = getattr(render_env, "metadata", None)
+    if isinstance(metadata, dict) and metadata.get("render_fps"):
+        return max(int(metadata["render_fps"]), 1)
 
-    def _rename_episode_video(episode_row: dict) -> None:
-        if not bool(args_cli.video):
+    base_env = getattr(render_env, "unwrapped", render_env)
+    step_dt = getattr(base_env, "step_dt", None)
+    if step_dt is not None and float(step_dt) > 0.0:
+        return max(int(round(1.0 / float(step_dt))), 1)
+    return 50
+
+
+class _EvalEpisodeVideoRecorder:
+    def __init__(self, render_env, video_folder: str):
+        self.render_env = render_env
+        self.video_folder = pathlib.Path(video_folder)
+        self.video_folder.mkdir(parents=True, exist_ok=True)
+        self.fps = _resolve_eval_video_fps(render_env)
+        self.frames = []
+        self.is_recording = False
+
+    def start_episode(self) -> None:
+        self.frames = []
+        self.is_recording = True
+        self.capture_frame()
+
+    def capture_frame(self) -> None:
+        if not self.is_recording:
             return
+        frame = self.render_env.render()
+        if isinstance(frame, list):
+            if not frame:
+                return
+            frame = frame[-1]
+        if frame is not None:
+            self.frames.append(frame)
 
-        completed_episode_id = int(getattr(record_video, "episode_id", 0)) - 1
-        if completed_episode_id < 0:
-            return
-
-        video_folder = pathlib.Path(record_video.video_folder)
-        source_path = video_folder / f"{record_video.name_prefix}-episode-{completed_episode_id}.mp4"
-        if not source_path.exists():
+    def finish_episode(self, episode_row: dict) -> None:
+        if not self.is_recording:
             return
 
         motion_name = _sanitize_video_stem(str(episode_row.get("motion_name", "motion")))
         episode_idx = int(episode_row.get("episode_index_for_motion", 0))
         status = "success" if bool(episode_row.get("success", False)) else "fail"
         target_stem = f"{motion_name}_episode_{episode_idx:03d}_{status}"
-        target_path = video_folder / f"{target_stem}.mp4"
+        target_path = self.video_folder / f"{target_stem}.mp4"
 
         dedup_index = 1
         while target_path.exists():
-            target_path = video_folder / f"{target_stem}_{dedup_index:02d}.mp4"
+            target_path = self.video_folder / f"{target_stem}_{dedup_index:02d}.mp4"
             dedup_index += 1
 
-        source_path.rename(target_path)
-        episode_row["video_file"] = str(target_path.resolve())
+        if not self.frames:
+            episode_row["video_file"] = None
+            print(f"[WARN] No rendered frames captured for eval video: {target_path}")
+        else:
+            from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
 
-    return _rename_episode_video
+            clip = ImageSequenceClip(self.frames, fps=self.fps)
+            clip.write_videofile(str(target_path), logger=None)
+            episode_row["video_file"] = str(target_path.resolve())
+
+        self.frames = []
+        self.is_recording = False
+
+
+def _get_eval_episode_video_recorder(env):
+    return getattr(env, "_eval_episode_video_recorder", None) or _EVAL_VIDEO_RECORDERS.get(id(env))
 
 
 def _load_runner_and_policy(env, agent_cfg: RslRlOnPolicyRunnerCfg, resume_path: str):
@@ -538,7 +568,7 @@ def _run_grouped_evaluation(
         ppo_runner, policy = _load_runner_and_policy(env, agent_cfg, resume_path)
         if args_cli.export_onnx:
             _export_policy_artifacts(env, ppo_runner, resume_path)
-        episode_video_callback = _build_eval_video_renamer(env)
+        video_recorder = _get_eval_episode_video_recorder(env)
         return evaluate_multi_motion_policy(
             env=env,
             policy=policy,
@@ -547,7 +577,9 @@ def _run_grouped_evaluation(
             max_steps=args_cli.eval_max_steps,
             print_interval=args_cli.eval_print_interval,
             force_full_motion_from_start=args_cli.eval_full_motion,
-            episode_callback=episode_video_callback,
+            episode_start_callback=video_recorder.start_episode if video_recorder is not None else None,
+            step_callback=video_recorder.capture_frame if video_recorder is not None else None,
+            episode_callback=video_recorder.finish_episode if video_recorder is not None else None,
         )
     finally:
         env.close()
@@ -580,7 +612,7 @@ def _run_separate_motion_evaluation(
             if not exported and args_cli.export_onnx:
                 _export_policy_artifacts(env, ppo_runner, resume_path)
                 exported = True
-            episode_video_callback = _build_eval_video_renamer(env)
+            video_recorder = _get_eval_episode_video_recorder(env)
             motion_result = evaluate_multi_motion_policy(
                 env=env,
                 policy=policy,
@@ -589,7 +621,9 @@ def _run_separate_motion_evaluation(
                 max_steps=args_cli.eval_max_steps,
                 print_interval=args_cli.eval_print_interval,
                 force_full_motion_from_start=args_cli.eval_full_motion,
-                episode_callback=episode_video_callback,
+                episode_start_callback=video_recorder.start_episode if video_recorder is not None else None,
+                step_callback=video_recorder.capture_frame if video_recorder is not None else None,
+                episode_callback=video_recorder.finish_episode if video_recorder is not None else None,
             )
         finally:
             env.close()
@@ -639,7 +673,7 @@ def _run_separate_motion_evaluation_reuse(
         ppo_runner, policy = _load_runner_and_policy(env, agent_cfg, resume_path)
         if args_cli.export_onnx:
             _export_policy_artifacts(env, ppo_runner, resume_path)
-        episode_video_callback = _build_eval_video_renamer(env)
+        video_recorder = _get_eval_episode_video_recorder(env)
 
         for motion_id, motion_file in enumerate(motion_files):
             motion_result = evaluate_multi_motion_policy(
@@ -652,7 +686,9 @@ def _run_separate_motion_evaluation_reuse(
                 force_full_motion_from_start=args_cli.eval_full_motion,
                 pinned_motion_id=motion_id,
                 reset_env=True,
-                episode_callback=episode_video_callback,
+                episode_start_callback=video_recorder.start_episode if video_recorder is not None else None,
+                step_callback=video_recorder.capture_frame if video_recorder is not None else None,
+                episode_callback=video_recorder.finish_episode if video_recorder is not None else None,
             )
 
             total_steps += int(motion_result.get("summary", {}).get("total_steps", 0))

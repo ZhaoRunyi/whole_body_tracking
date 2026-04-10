@@ -440,6 +440,8 @@ def evaluate_multi_motion_policy(
     force_full_motion_from_start: bool = False,
     pinned_motion_id: int | None = None,
     reset_env: bool = True,
+    episode_start_callback=None,
+    step_callback=None,
     episode_callback=None,
 ) -> dict[str, Any]:
     if target_episodes_per_motion <= 0:
@@ -482,6 +484,8 @@ def evaluate_multi_motion_policy(
         _force_motion_frame(base_env, motion_command, all_env_ids, time_step=0)
 
     obs, _ = env.get_observations()
+    if episode_start_callback is not None:
+        episode_start_callback()
 
     robot = base_env.scene["robot"]
     sensors = getattr(base_env.scene, "sensors", None)
@@ -518,6 +522,8 @@ def evaluate_multi_motion_policy(
                 episode_metric_sums[metric_name] += metric_values
 
             obs, rewards, dones, info = env.step(actions)
+            if step_callback is not None:
+                step_callback()
 
         reward_values = _to_float_tensor(rewards, num_envs, device)
         done_mask = _to_bool_mask(dones, num_envs, device)
@@ -598,6 +604,8 @@ def evaluate_multi_motion_policy(
                     motion_command.motion_ids[done_env_ids] = int(pinned_motion_id)
                 _force_motion_frame(base_env, motion_command, done_env_ids, time_step=0)
                 obs, _ = env.get_observations()
+            if episode_start_callback is not None and not aggregator.is_target_reached():
+                episode_start_callback()
 
         previous_actions = actions.detach()
         total_steps += 1
