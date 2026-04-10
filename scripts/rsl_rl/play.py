@@ -488,6 +488,23 @@ class _EvalEpisodeVideoRenamer:
     def __init__(self, record_video_wrapper):
         self.record_video_wrapper = record_video_wrapper
         self.video_folder = pathlib.Path(record_video_wrapper.video_folder)
+        self.current_video_path: pathlib.Path | None = None
+        self.current_metadata_path: pathlib.Path | None = None
+
+    def start_episode(self) -> None:
+        if not bool(args_cli.video):
+            return
+
+        # Keep RecordVideo's internal episode state aligned with the evaluator's episode boundary.
+        self.record_video_wrapper.terminated = False
+        self.record_video_wrapper.truncated = False
+        if not self.record_video_wrapper.recording:
+            self.record_video_wrapper.start_video_recorder()
+
+        video_recorder = getattr(self.record_video_wrapper, "video_recorder", None)
+        self.current_video_path = pathlib.Path(video_recorder.path) if video_recorder is not None else None
+        metadata_path = getattr(video_recorder, "metadata_path", None) if video_recorder is not None else None
+        self.current_metadata_path = pathlib.Path(metadata_path) if metadata_path is not None else None
 
     def finish_episode(self, episode_row: dict) -> None:
         motion_name = _sanitize_video_stem(str(episode_row.get("motion_name", "motion")))
@@ -501,16 +518,20 @@ class _EvalEpisodeVideoRenamer:
             target_path = self.video_folder / f"{target_stem}_{dedup_index:02d}.mp4"
             dedup_index += 1
 
-        source_episode_id = int(getattr(self.record_video_wrapper, "episode_id", 0)) - 1
-        source_path = self.video_folder / f"{self.record_video_wrapper.name_prefix}-episode-{source_episode_id}.mp4"
-        source_metadata_path = self.video_folder / f"{self.record_video_wrapper.name_prefix}-episode-{source_episode_id}.meta.json"
-        if not source_path.exists():
+        source_path = self.current_video_path
+        source_metadata_path = self.current_metadata_path
+        if self.record_video_wrapper.recording:
+            self.record_video_wrapper.close_video_recorder()
+
+        if source_path is None or not source_path.exists():
             episode_row["video_file"] = None
             print(f"[WARN] Expected eval video was not written: {source_path}")
+            self.current_video_path = None
+            self.current_metadata_path = None
             return
 
         source_path.rename(target_path)
-        if source_metadata_path.exists():
+        if source_metadata_path is not None and source_metadata_path.exists():
             source_metadata_path.rename(target_path.with_suffix(".meta.json"))
         episode_row["video_file"] = str(target_path.resolve())
 
@@ -520,6 +541,9 @@ class _EvalEpisodeVideoRenamer:
             episode_row["video_padded_for_viewing"] = padded
             if padded:
                 episode_row["video_padding_tail_seconds"] = SHORT_EVAL_VIDEO_TAIL_SECONDS
+
+        self.current_video_path = None
+        self.current_metadata_path = None
 
 
 def _get_eval_episode_video_renamer(env):
@@ -603,6 +627,7 @@ def _run_grouped_evaluation(
             max_steps=args_cli.eval_max_steps,
             print_interval=args_cli.eval_print_interval,
             force_full_motion_from_start=args_cli.eval_full_motion,
+            episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
             episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
         )
     finally:
@@ -645,6 +670,7 @@ def _run_separate_motion_evaluation(
                 max_steps=args_cli.eval_max_steps,
                 print_interval=args_cli.eval_print_interval,
                 force_full_motion_from_start=args_cli.eval_full_motion,
+                episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
                 episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
             )
         finally:
@@ -708,6 +734,7 @@ def _run_separate_motion_evaluation_reuse(
                 force_full_motion_from_start=args_cli.eval_full_motion,
                 pinned_motion_id=motion_id,
                 reset_env=True,
+                episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
                 episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
             )
 
