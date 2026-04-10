@@ -447,6 +447,22 @@ class _EvalRecordVideo(gym.wrappers.RecordVideo):
             except TypeError:
                 self.start_recording()
 
+    def _eval_video_enabled(self) -> bool:
+        video_enabled = getattr(self, "_video_enabled", None)
+        if callable(video_enabled):
+            try:
+                return bool(video_enabled())
+            except TypeError:
+                pass
+
+        step_trigger = getattr(self, "step_trigger", None)
+        if callable(step_trigger):
+            return bool(step_trigger(int(getattr(self, "step_id", 0))))
+        episode_trigger = getattr(self, "episode_trigger", None)
+        if callable(episode_trigger):
+            return bool(episode_trigger(int(getattr(self, "episode_id", 0))))
+        return False
+
     def _close_eval_recorder(self) -> None:
         if hasattr(self, "close_video_recorder"):
             self.close_video_recorder()
@@ -466,24 +482,22 @@ class _EvalRecordVideo(gym.wrappers.RecordVideo):
         if not (bool(getattr(self, "terminated", False)) or bool(getattr(self, "truncated", False))):
             if bool(getattr(self, "recording", False)):
                 self._capture_eval_frame()
-                if self.video_length > 0 and self._recorded_frame_count() > self.video_length:
+                video_length = int(getattr(self, "video_length", 0))
+                if video_length > 0 and self._recorded_frame_count() > video_length:
                     self._close_eval_recorder()
-            elif self._video_enabled():
+            elif self._eval_video_enabled():
                 self._start_eval_recorder()
 
         observations, rewards, terminateds, truncateds, infos = self.env.step(action)
 
         if not (bool(getattr(self, "terminated", False)) or bool(getattr(self, "truncated", False))):
-            self.step_id += 1
-            if not self.is_vector_env:
-                if terminateds or truncateds:
-                    self.episode_id += 1
-                    self.terminated = terminateds
-                    self.truncated = truncateds
-            elif _as_first_done(terminateds) or _as_first_done(truncateds):
-                self.episode_id += 1
-                self.terminated = _as_first_done(terminateds)
-                self.truncated = _as_first_done(truncateds)
+            self.step_id = int(getattr(self, "step_id", 0)) + 1
+            terminated = _as_first_done(terminateds)
+            truncated = _as_first_done(truncateds)
+            if terminated or truncated:
+                self.episode_id = int(getattr(self, "episode_id", 0)) + 1
+                self.terminated = terminated
+                self.truncated = truncated
 
         return observations, rewards, terminateds, truncateds, infos
 
