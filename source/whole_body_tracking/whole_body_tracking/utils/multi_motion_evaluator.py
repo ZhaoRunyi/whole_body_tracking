@@ -118,7 +118,7 @@ def _get_body_indexes(motion_command, body_names: list[str] | tuple[str, ...] | 
     return [idx for idx, name in enumerate(motion_command.cfg.body_names) if name in selected]
 
 
-def _classify_episode_outcomes(base_env, motion_command, timeout_mask: torch.Tensor, done_env_ids: torch.Tensor) -> list[dict[str, Any]]:
+def _compute_episode_reason_masks(base_env, motion_command, timeout_mask: torch.Tensor) -> dict[str, torch.Tensor]:
     num_envs = int(motion_command.motion_ids.shape[0])
     device = motion_command.motion_ids.device
 
@@ -148,7 +148,7 @@ def _classify_episode_outcomes(base_env, motion_command, timeout_mask: torch.Ten
     else:
         ee_body_pos_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
-    reason_masks = {
+    return {
         "motion_end": motion_end_mask,
         "time_out": timeout_mask,
         "anchor_pos": anchor_pos_mask,
@@ -156,17 +156,27 @@ def _classify_episode_outcomes(base_env, motion_command, timeout_mask: torch.Ten
         "ee_body_pos": ee_body_pos_mask,
     }
 
+
+def _select_reason_for_env(reason_masks: dict[str, torch.Tensor], env_id: int) -> str:
+    reason = "terminated"
+    for candidate in PRIMARY_TERMINATION_REASON_ORDER:
+        if candidate == "terminated":
+            continue
+        candidate_mask = reason_masks.get(candidate)
+        if candidate_mask is not None and bool(candidate_mask[env_id].item()):
+            reason = candidate
+            break
+    return reason
+
+
+def _classify_episode_outcomes(
+    base_env, motion_command, timeout_mask: torch.Tensor, done_env_ids: torch.Tensor
+) -> list[dict[str, Any]]:
+    reason_masks = _compute_episode_reason_masks(base_env, motion_command, timeout_mask)
     outcomes: list[dict[str, Any]] = []
     for env_id_tensor in done_env_ids:
         env_id = int(env_id_tensor.item())
-        reason = "terminated"
-        for candidate in PRIMARY_TERMINATION_REASON_ORDER:
-            if candidate == "terminated":
-                continue
-            candidate_mask = reason_masks.get(candidate)
-            if candidate_mask is not None and bool(candidate_mask[env_id].item()):
-                reason = candidate
-                break
+        reason = _select_reason_for_env(reason_masks, env_id)
         outcomes.append(
             {
                 "success": reason in SUCCESS_REASON_KEYS,
@@ -287,6 +297,28 @@ def _reset_env_if_possible(env) -> None:
     reset_output = reset_fn()
     if isinstance(reset_output, tuple):
         return
+
+
+def _reset_env_ids_if_possible(env, base_env, env_ids: torch.Tensor) -> bool:
+    if env_ids.numel() == 0:
+        return True
+
+    for reset_target in (base_env, getattr(env, "unwrapped", None)):
+        if reset_target is None:
+            continue
+        reset_fn = getattr(reset_target, "reset", None)
+        if reset_fn is None:
+            continue
+        try:
+            reset_fn(env_ids=env_ids)
+            return True
+        except TypeError:
+            continue
+
+    if int(env_ids.numel()) == int(getattr(env, "num_envs", 0)):
+        _reset_env_if_possible(env)
+        return True
+    return False
 
 
 def _collect_step_metrics(
@@ -440,6 +472,8 @@ def evaluate_multi_motion_policy(
     force_full_motion_from_start: bool = False,
     pinned_motion_id: int | None = None,
     reset_env: bool = True,
+    failure_hold_steps: int = 0,
+    logical_timeout_steps: int | None = None,
     episode_start_callback=None,
     episode_callback=None,
 ) -> dict[str, Any]:
@@ -447,6 +481,9 @@ def evaluate_multi_motion_policy(
         raise ValueError("target_episodes_per_motion must be > 0.")
     if max_steps is not None and max_steps <= 0:
         max_steps = None
+    failure_hold_steps = max(int(failure_hold_steps), 0)
+    if logical_timeout_steps is not None and logical_timeout_steps <= 0:
+        logical_timeout_steps = None
 
     base_env = getattr(env, "unwrapped", env)
     motion_command = base_env.command_manager.get_term("motion")
@@ -461,7 +498,7 @@ def evaluate_multi_motion_policy(
     tracked_motion_labels = [all_motion_labels[motion_id] for motion_id in tracked_motion_ids]
     tracked_motion_index = {motion_id: local_idx for local_idx, motion_id in enumerate(tracked_motion_ids)}
 
-    expected_episode_length_steps = _resolve_expected_episode_length_steps(base_env)
+    expected_episode_length_steps = logical_timeout_steps or _resolve_expected_episode_length_steps(base_env)
     aggregator = _MotionEpisodeAggregator(
         motion_labels=tracked_motion_labels,
         target_episodes_per_motion=target_episodes_per_motion,
@@ -499,6 +536,11 @@ def evaluate_multi_motion_policy(
     episode_return = torch.zeros(num_envs, dtype=torch.float32, device=device)
     episode_length = torch.zeros(num_envs, dtype=torch.long, device=device)
     episode_metric_sums: dict[str, torch.Tensor] = {}
+    pending_failure = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    failure_reason_by_env = ["" for _ in range(num_envs)]
+    failure_length = torch.zeros(num_envs, dtype=torch.long, device=device)
+    failure_return = torch.zeros(num_envs, dtype=torch.float32, device=device)
+    failure_metric_sums: dict[str, torch.Tensor] = {}
     previous_actions = None
     episode_rows: list[dict[str, Any]] = []
 
@@ -523,26 +565,82 @@ def evaluate_multi_motion_policy(
             obs, rewards, dones, info = env.step(actions)
 
         reward_values = _to_float_tensor(rewards, num_envs, device)
-        done_mask = _to_bool_mask(dones, num_envs, device)
-        timeout_mask = _extract_time_out_mask(info, num_envs, device)
+        env_done_mask = _to_bool_mask(dones, num_envs, device)
+        env_timeout_mask = _extract_time_out_mask(info, num_envs, device)
 
         episode_return += reward_values
         episode_length += 1
 
+        if logical_timeout_steps is None:
+            logical_timeout_mask = env_timeout_mask
+        else:
+            logical_timeout_mask = episode_length >= int(logical_timeout_steps)
+        timeout_mask = env_timeout_mask | logical_timeout_mask
+        reason_masks = _compute_episode_reason_masks(base_env, motion_command, timeout_mask)
+
+        failure_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        for failure_reason in ("anchor_pos", "anchor_ori", "ee_body_pos"):
+            failure_mask |= reason_masks.get(failure_reason, torch.zeros_like(failure_mask))
+        new_failure_mask = failure_mask & (~pending_failure)
+        new_failure_env_ids = new_failure_mask.nonzero(as_tuple=False).flatten()
+        if new_failure_env_ids.numel() > 0:
+            pending_failure[new_failure_env_ids] = True
+            failure_length[new_failure_env_ids] = episode_length[new_failure_env_ids]
+            failure_return[new_failure_env_ids] = episode_return[new_failure_env_ids]
+            for metric_name, metric_accumulator in episode_metric_sums.items():
+                if metric_name not in failure_metric_sums:
+                    failure_metric_sums[metric_name] = torch.zeros(num_envs, dtype=torch.float32, device=device)
+                failure_metric_sums[metric_name][new_failure_env_ids] = metric_accumulator[new_failure_env_ids]
+            for env_id_tensor in new_failure_env_ids:
+                env_id = int(env_id_tensor.item())
+                failure_reason_by_env[env_id] = _select_reason_for_env(reason_masks, env_id)
+
+        held_failure_done_mask = pending_failure & ((episode_length - failure_length) >= failure_hold_steps)
+        natural_success_mask = (reason_masks["motion_end"] | timeout_mask) & (~pending_failure)
+        done_mask = env_done_mask | natural_success_mask | held_failure_done_mask
         done_env_ids = done_mask.nonzero(as_tuple=False).flatten()
         if done_env_ids.numel() > 0:
             done_motion_ids = current_motion_ids[done_env_ids].detach().cpu().tolist()
-            done_returns = episode_return[done_env_ids].detach().cpu().tolist()
-            done_lengths = episode_length[done_env_ids].detach().cpu().tolist()
             done_timeouts = timeout_mask[done_env_ids].detach().cpu().tolist()
-            done_outcomes = _classify_episode_outcomes(base_env, motion_command, timeout_mask, done_env_ids)
 
+            done_returns: list[float] = []
+            done_lengths: list[int] = []
+            video_lengths: list[int] = []
+            failure_detected_steps: list[int | None] = []
+            done_outcomes: list[dict[str, Any]] = []
             metric_means_by_env: list[dict[str, float]] = []
             for local_idx, env_id_tensor in enumerate(done_env_ids):
                 env_id = int(env_id_tensor.item())
-                episode_steps = max(int(done_lengths[local_idx]), 1)
+                is_failed_episode = bool(pending_failure[env_id].item())
+                if is_failed_episode:
+                    episode_steps = max(int(failure_length[env_id].item()), 1)
+                    done_returns.append(float(failure_return[env_id].item()))
+                    done_lengths.append(episode_steps)
+                    video_lengths.append(int(episode_length[env_id].item()))
+                    failure_detected_steps.append(episode_steps)
+                    done_outcomes.append(
+                        {
+                            "success": False,
+                            "termination_reason": failure_reason_by_env[env_id] or "terminated",
+                        }
+                    )
+                else:
+                    episode_steps = max(int(episode_length[env_id].item()), 1)
+                    done_returns.append(float(episode_return[env_id].item()))
+                    done_lengths.append(episode_steps)
+                    video_lengths.append(episode_steps)
+                    failure_detected_steps.append(None)
+                    reason = _select_reason_for_env(reason_masks, env_id)
+                    done_outcomes.append(
+                        {
+                            "success": reason in SUCCESS_REASON_KEYS,
+                            "termination_reason": reason,
+                        }
+                    )
+
                 mean_metrics: dict[str, float] = {}
-                for metric_name, metric_accumulator in episode_metric_sums.items():
+                metric_source = failure_metric_sums if is_failed_episode else episode_metric_sums
+                for metric_name, metric_accumulator in metric_source.items():
                     mean_metrics[metric_name] = float(metric_accumulator[env_id].item() / episode_steps)
                 metric_means_by_env.append(mean_metrics)
 
@@ -576,7 +674,11 @@ def evaluate_multi_motion_policy(
                     "episode_return": float(done_returns[local_idx]),
                     "episode_length_steps": int(done_lengths[local_idx]),
                     "episode_length_ratio": episode_length_ratio,
+                    "video_length_steps": int(video_lengths[local_idx]),
                 }
+                if failure_detected_steps[local_idx] is not None:
+                    episode_row["failure_detected_step"] = int(failure_detected_steps[local_idx])
+                    episode_row["failure_hold_steps"] = int(video_lengths[local_idx] - done_lengths[local_idx])
                 episode_rows.append(episode_row)
                 status = "SUCCESS" if episode_row["success"] else "FAIL"
                 print(
@@ -593,9 +695,19 @@ def evaluate_multi_motion_policy(
 
             episode_return[done_env_ids] = 0.0
             episode_length[done_env_ids] = 0
+            pending_failure[done_env_ids] = False
+            failure_length[done_env_ids] = 0
+            failure_return[done_env_ids] = 0.0
+            for env_id_tensor in done_env_ids:
+                failure_reason_by_env[int(env_id_tensor.item())] = ""
             for metric_accumulator in episode_metric_sums.values():
                 metric_accumulator[done_env_ids] = 0.0
+            for metric_accumulator in failure_metric_sums.values():
+                metric_accumulator[done_env_ids] = 0.0
 
+            manual_done_env_ids = done_env_ids[(~env_done_mask[done_env_ids]).nonzero(as_tuple=False).flatten()]
+            if manual_done_env_ids.numel() > 0:
+                _reset_env_ids_if_possible(env, base_env, manual_done_env_ids)
             if force_full_motion_from_start:
                 if pinned_motion_id is not None:
                     motion_command.motion_ids[done_env_ids] = int(pinned_motion_id)
@@ -625,6 +737,8 @@ def evaluate_multi_motion_policy(
         "print_interval": int(print_interval),
         "force_full_motion_from_start": bool(force_full_motion_from_start),
         "pinned_motion_id": pinned_motion_id,
+        "failure_hold_steps": int(failure_hold_steps),
+        "logical_timeout_steps": logical_timeout_steps,
         "tracked_motion_ids": tracked_motion_ids,
         "motion_files": [os.path.abspath(all_motion_files[motion_id]) for motion_id in tracked_motion_ids],
     }

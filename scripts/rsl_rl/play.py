@@ -172,6 +172,7 @@ REQUIRED_MOTION_KEYS = (
 )
 
 _EVAL_VIDEO_RENAMERS = {}
+EVAL_FAILURE_HOLD_SECONDS = 200.0
 
 SAMPLING_STRATEGY_KEY_ALIASES = {
     "preset": "sampling_preset",
@@ -369,6 +370,49 @@ def _configure_motion_sampling_for_evaluation(
     motion_cfg.phase_sampling_window = "full_motion" if force_full_motion else "truncate_to_episode"
     motion_cfg.phase_sampling_strategy = "uniform"
     motion_cfg.motion_end_behavior = "terminate_episode"
+
+
+def _get_env_step_dt(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg) -> float:
+    return float(env_cfg.decimation) * float(env_cfg.sim.dt)
+
+
+def _disable_termination_terms(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    term_names: tuple[str, ...],
+) -> None:
+    terminations = getattr(env_cfg, "terminations", None)
+    if terminations is None:
+        return
+    for term_name in term_names:
+        if hasattr(terminations, term_name):
+            setattr(terminations, term_name, None)
+
+
+def _configure_failure_hold_for_evaluation(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    hold_seconds: float,
+) -> tuple[int, int | None]:
+    if hold_seconds <= 0.0:
+        return 0, None
+
+    step_dt = _get_env_step_dt(env_cfg)
+    if step_dt <= 0.0:
+        raise ValueError(f"Invalid environment step dt for eval failure hold: {step_dt}")
+
+    original_episode_length_s = float(env_cfg.episode_length_s)
+    logical_timeout_steps = max(int(round(original_episode_length_s / step_dt)), 1)
+    failure_hold_steps = max(int(round(float(hold_seconds) / step_dt)), 1)
+
+    # Env-side failure terminations auto-reset before play.py can record the failure state. Disable them and
+    # let the evaluator mark failures manually, then keep stepping for the requested hold window.
+    _disable_termination_terms(env_cfg, ("motion_end", "anchor_pos", "anchor_ori", "ee_body_pos"))
+    env_cfg.episode_length_s = original_episode_length_s + float(hold_seconds)
+    print(
+        "[INFO] Deferred failure termination enabled: "
+        f"hold_seconds={hold_seconds}, hold_steps={failure_hold_steps}, "
+        f"logical_timeout_steps={logical_timeout_steps}, env_episode_length_s={env_cfg.episode_length_s}"
+    )
+    return failure_hold_steps, logical_timeout_steps
 
 
 def _configure_play_visualization(
@@ -746,6 +790,8 @@ def _run_grouped_evaluation(
     resume_path: str,
     log_dir: str,
     eval_artifact_dir: str,
+    failure_hold_steps: int,
+    logical_timeout_steps: int | None,
 ) -> dict:
     env = _create_wrapped_env(
         env_cfg,
@@ -767,6 +813,8 @@ def _run_grouped_evaluation(
             max_steps=args_cli.eval_max_steps,
             print_interval=args_cli.eval_print_interval,
             force_full_motion_from_start=args_cli.eval_full_motion,
+            failure_hold_steps=failure_hold_steps,
+            logical_timeout_steps=logical_timeout_steps,
             episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
             episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
         )
@@ -780,6 +828,8 @@ def _run_separate_motion_evaluation(
     resume_path: str,
     log_dir: str,
     eval_artifact_dir: str,
+    failure_hold_steps: int,
+    logical_timeout_steps: int | None,
 ) -> dict:
     motion_files = _get_motion_file_list_from_cfg(env_cfg)
     combined_rows: list[dict] = []
@@ -810,6 +860,8 @@ def _run_separate_motion_evaluation(
                 max_steps=args_cli.eval_max_steps,
                 print_interval=args_cli.eval_print_interval,
                 force_full_motion_from_start=args_cli.eval_full_motion,
+                failure_hold_steps=failure_hold_steps,
+                logical_timeout_steps=logical_timeout_steps,
                 episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
                 episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
             )
@@ -843,6 +895,8 @@ def _run_separate_motion_evaluation_reuse(
     resume_path: str,
     log_dir: str,
     eval_artifact_dir: str,
+    failure_hold_steps: int,
+    logical_timeout_steps: int | None,
 ) -> dict:
     motion_files = _get_motion_file_list_from_cfg(env_cfg)
     combined_rows: list[dict] = []
@@ -874,6 +928,8 @@ def _run_separate_motion_evaluation_reuse(
                 force_full_motion_from_start=args_cli.eval_full_motion,
                 pinned_motion_id=motion_id,
                 reset_env=True,
+                failure_hold_steps=failure_hold_steps,
+                logical_timeout_steps=logical_timeout_steps,
                 episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
                 episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
             )
@@ -963,8 +1019,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _apply_motion_override(env_cfg, selected_motion_files)
     configured_motion_files = _get_motion_file_list_from_cfg(env_cfg)
 
+    failure_hold_steps = 0
+    logical_timeout_steps = None
     if args_cli.evaluate:
         _configure_motion_sampling_for_evaluation(env_cfg, force_full_motion=args_cli.eval_full_motion)
+        failure_hold_steps, logical_timeout_steps = _configure_failure_hold_for_evaluation(
+            env_cfg, hold_seconds=EVAL_FAILURE_HOLD_SECONDS
+        )
         if args_cli.sampling_strategy and args_cli.eval_full_motion:
             print("[WARN] --sampling_strategy is ignored when --eval_full_motion is enabled.")
         elif args_cli.sampling_strategy:
@@ -987,10 +1048,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         eval_artifact_dir = _make_eval_artifact_dir(log_dir)
         if resolved_eval_mode == "separate":
             result = _run_separate_motion_evaluation_reuse(
-                env_cfg, agent_cfg, resume_path, log_dir, eval_artifact_dir
+                env_cfg,
+                agent_cfg,
+                resume_path,
+                log_dir,
+                eval_artifact_dir,
+                failure_hold_steps=failure_hold_steps,
+                logical_timeout_steps=logical_timeout_steps,
             )
         else:
-            result = _run_grouped_evaluation(env_cfg, agent_cfg, resume_path, log_dir, eval_artifact_dir)
+            result = _run_grouped_evaluation(
+                env_cfg,
+                agent_cfg,
+                resume_path,
+                log_dir,
+                eval_artifact_dir,
+                failure_hold_steps=failure_hold_steps,
+                logical_timeout_steps=logical_timeout_steps,
+            )
         result.setdefault("config", {})
         result["config"].update(
             {
@@ -1001,6 +1076,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "motion_files": configured_motion_files,
                 "eval_mode": resolved_eval_mode,
                 "eval_full_motion": args_cli.eval_full_motion,
+                "eval_failure_hold_seconds": EVAL_FAILURE_HOLD_SECONDS,
+                "eval_failure_hold_steps": int(failure_hold_steps),
+                "eval_logical_timeout_steps": logical_timeout_steps,
                 "eval_artifact_dir": str(pathlib.Path(eval_artifact_dir).resolve()),
             }
         )
