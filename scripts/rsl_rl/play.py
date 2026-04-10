@@ -490,21 +490,71 @@ class _EvalEpisodeVideoRenamer:
         self.video_folder = pathlib.Path(record_video_wrapper.video_folder)
         self.current_video_path: pathlib.Path | None = None
         self.current_metadata_path: pathlib.Path | None = None
+        self.video_files_before_episode: set[pathlib.Path] = set()
+        self.manual_episode_index = 0
 
     def start_episode(self) -> None:
         if not bool(args_cli.video):
             return
 
+        self.video_folder.mkdir(parents=True, exist_ok=True)
+        self.video_files_before_episode = self._snapshot_video_files()
         # Keep RecordVideo's internal episode state aligned with the evaluator's episode boundary.
         self.record_video_wrapper.terminated = False
         self.record_video_wrapper.truncated = False
-        if not self.record_video_wrapper.recording:
-            self.record_video_wrapper.start_video_recorder()
+        if not bool(getattr(self.record_video_wrapper, "recording", False)):
+            self._start_recording()
 
         video_recorder = getattr(self.record_video_wrapper, "video_recorder", None)
         self.current_video_path = pathlib.Path(video_recorder.path) if video_recorder is not None else None
         metadata_path = getattr(video_recorder, "metadata_path", None) if video_recorder is not None else None
         self.current_metadata_path = pathlib.Path(metadata_path) if metadata_path is not None else None
+
+    def _snapshot_video_files(self) -> set[pathlib.Path]:
+        return {path.resolve() for path in self.video_folder.glob("*.mp4")}
+
+    def _start_recording(self) -> None:
+        self.manual_episode_index += 1
+        if hasattr(self.record_video_wrapper, "start_video_recorder"):
+            self.record_video_wrapper.start_video_recorder()
+            return
+        if hasattr(self.record_video_wrapper, "start_recording"):
+            self.record_video_wrapper.start_recording(f"eval-manual-episode-{self.manual_episode_index}")
+            return
+        print("[WARN] RecordVideo wrapper has no known start recording method; video may not align with eval episodes.")
+
+    def _stop_recording(self) -> None:
+        if not bool(getattr(self.record_video_wrapper, "recording", False)):
+            return
+        if hasattr(self.record_video_wrapper, "close_video_recorder"):
+            self.record_video_wrapper.close_video_recorder()
+            return
+        if hasattr(self.record_video_wrapper, "stop_recording"):
+            self.record_video_wrapper.stop_recording()
+            return
+
+        video_recorder = getattr(self.record_video_wrapper, "video_recorder", None)
+        if video_recorder is not None and hasattr(video_recorder, "close"):
+            video_recorder.close()
+            self.record_video_wrapper.recording = False
+            return
+        print("[WARN] RecordVideo wrapper has no known stop recording method; cannot finalize eval video.")
+
+    def _find_closed_video_path(self) -> pathlib.Path | None:
+        candidates: list[pathlib.Path] = []
+        if self.current_video_path is not None:
+            candidates.append(self.current_video_path)
+
+        after_files = self._snapshot_video_files()
+        candidates.extend(sorted(after_files - self.video_files_before_episode, key=lambda path: path.stat().st_mtime))
+        candidates = [path for path in candidates if path.exists()]
+        if candidates:
+            return candidates[-1]
+
+        all_files = [path for path in self.video_folder.glob("*.mp4") if path.exists()]
+        if not all_files:
+            return None
+        return max(all_files, key=lambda path: path.stat().st_mtime)
 
     def finish_episode(self, episode_row: dict) -> None:
         motion_name = _sanitize_video_stem(str(episode_row.get("motion_name", "motion")))
@@ -520,14 +570,19 @@ class _EvalEpisodeVideoRenamer:
 
         source_path = self.current_video_path
         source_metadata_path = self.current_metadata_path
-        if self.record_video_wrapper.recording:
-            self.record_video_wrapper.close_video_recorder()
+        self._stop_recording()
+        source_path = self._find_closed_video_path()
+        if source_path is not None and source_metadata_path is None:
+            guessed_metadata_path = source_path.with_suffix(".meta.json")
+            if guessed_metadata_path.exists():
+                source_metadata_path = guessed_metadata_path
 
         if source_path is None or not source_path.exists():
             episode_row["video_file"] = None
             print(f"[WARN] Expected eval video was not written: {source_path}")
             self.current_video_path = None
             self.current_metadata_path = None
+            self.video_files_before_episode = set()
             return
 
         source_path.rename(target_path)
@@ -544,6 +599,7 @@ class _EvalEpisodeVideoRenamer:
 
         self.current_video_path = None
         self.current_metadata_path = None
+        self.video_files_before_episode = set()
 
 
 def _get_eval_episode_video_renamer(env):
