@@ -395,12 +395,67 @@ def _as_first_done(done_value) -> bool:
 class _EvalRecordVideo(gym.wrappers.RecordVideo):
     """Record eval frames before env.step() so terminal auto-reset frames do not leak into the clip."""
 
+    def _recorded_frame_count(self) -> int:
+        recorded_frames = getattr(self, "recorded_frames", 0)
+        if isinstance(recorded_frames, int):
+            return recorded_frames
+        try:
+            return len(recorded_frames)
+        except TypeError:
+            return 0
+
+    def _capture_eval_frame(self) -> bool:
+        video_recorder = getattr(self, "video_recorder", None)
+        if video_recorder is not None and hasattr(video_recorder, "capture_frame"):
+            video_recorder.capture_frame()
+            if isinstance(getattr(self, "recorded_frames", None), int):
+                self.recorded_frames += 1
+            return True
+
+        for capture_attr in ("_capture_frame", "capture_frame"):
+            capture_frame = getattr(self, capture_attr, None)
+            if callable(capture_frame):
+                try:
+                    capture_frame()
+                    return True
+                except TypeError:
+                    continue
+
+        recorded_frames = getattr(self, "recorded_frames", None)
+        if isinstance(recorded_frames, list):
+            frame = self.env.render()
+            if frame is None:
+                return False
+            if isinstance(frame, list):
+                recorded_frames.extend(frame)
+            else:
+                recorded_frames.append(frame)
+            return True
+
+        return False
+
+    def _start_eval_recorder(self) -> None:
+        if hasattr(self, "start_video_recorder"):
+            try:
+                self.start_video_recorder()
+                return
+            except AttributeError:
+                pass
+        if hasattr(self, "start_recording"):
+            try:
+                self.start_recording(f"eval-manual-step-{getattr(self, 'step_id', 0)}")
+            except TypeError:
+                self.start_recording()
+
     def _close_eval_recorder(self) -> None:
         if hasattr(self, "close_video_recorder"):
             self.close_video_recorder()
             return
         if hasattr(self, "stop_recording"):
-            self.stop_recording()
+            try:
+                self.stop_recording()
+            except TypeError:
+                self.stop_recording(None)
             return
         video_recorder = getattr(self, "video_recorder", None)
         if video_recorder is not None and hasattr(video_recorder, "close"):
@@ -408,19 +463,17 @@ class _EvalRecordVideo(gym.wrappers.RecordVideo):
         self.recording = False
 
     def step(self, action):
-        if not (self.terminated or self.truncated):
-            if self.recording:
-                assert self.video_recorder is not None
-                self.video_recorder.capture_frame()
-                self.recorded_frames += 1
-                if self.video_length > 0 and self.recorded_frames > self.video_length:
+        if not (bool(getattr(self, "terminated", False)) or bool(getattr(self, "truncated", False))):
+            if bool(getattr(self, "recording", False)):
+                self._capture_eval_frame()
+                if self.video_length > 0 and self._recorded_frame_count() > self.video_length:
                     self._close_eval_recorder()
             elif self._video_enabled():
-                self.start_video_recorder()
+                self._start_eval_recorder()
 
         observations, rewards, terminateds, truncateds, infos = self.env.step(action)
 
-        if not (self.terminated or self.truncated):
+        if not (bool(getattr(self, "terminated", False)) or bool(getattr(self, "truncated", False))):
             self.step_id += 1
             if not self.is_vector_env:
                 if terminateds or truncateds:
