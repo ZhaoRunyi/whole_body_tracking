@@ -6,8 +6,6 @@ import argparse
 import os
 import pathlib
 import re
-import shutil
-import subprocess
 import sys
 from datetime import datetime
 
@@ -174,8 +172,6 @@ REQUIRED_MOTION_KEYS = (
 )
 
 _EVAL_VIDEO_RENAMERS = {}
-SHORT_EVAL_VIDEO_PAD_STEPS = 2
-SHORT_EVAL_VIDEO_TAIL_SECONDS = 2.0
 
 SAMPLING_STRATEGY_KEY_ALIASES = {
     "preset": "sampling_preset",
@@ -387,6 +383,58 @@ def _configure_play_visualization(
         contact_sensor_cfg.debug_vis = False
 
 
+def _as_first_done(done_value) -> bool:
+    if isinstance(done_value, torch.Tensor):
+        return bool(done_value.reshape(-1)[0].item())
+    array_value = np.asarray(done_value)
+    if array_value.ndim > 0:
+        return bool(array_value.reshape(-1)[0].item())
+    return bool(array_value.item())
+
+
+class _EvalRecordVideo(gym.wrappers.RecordVideo):
+    """Record eval frames before env.step() so terminal auto-reset frames do not leak into the clip."""
+
+    def _close_eval_recorder(self) -> None:
+        if hasattr(self, "close_video_recorder"):
+            self.close_video_recorder()
+            return
+        if hasattr(self, "stop_recording"):
+            self.stop_recording()
+            return
+        video_recorder = getattr(self, "video_recorder", None)
+        if video_recorder is not None and hasattr(video_recorder, "close"):
+            video_recorder.close()
+        self.recording = False
+
+    def step(self, action):
+        if not (self.terminated or self.truncated):
+            if self.recording:
+                assert self.video_recorder is not None
+                self.video_recorder.capture_frame()
+                self.recorded_frames += 1
+                if self.video_length > 0 and self.recorded_frames > self.video_length:
+                    self._close_eval_recorder()
+            elif self._video_enabled():
+                self.start_video_recorder()
+
+        observations, rewards, terminateds, truncateds, infos = self.env.step(action)
+
+        if not (self.terminated or self.truncated):
+            self.step_id += 1
+            if not self.is_vector_env:
+                if terminateds or truncateds:
+                    self.episode_id += 1
+                    self.terminated = terminateds
+                    self.truncated = truncateds
+            elif _as_first_done(terminateds) or _as_first_done(truncateds):
+                self.episode_id += 1
+                self.terminated = _as_first_done(terminateds)
+                self.truncated = _as_first_done(truncateds)
+
+        return observations, rewards, terminateds, truncateds, infos
+
+
 def _create_wrapped_env(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     log_dir: str,
@@ -403,14 +451,16 @@ def _create_wrapped_env(
             eval_video_folder = os.path.join(eval_artifact_dir, "videos")
             video_kwargs = {
                 "video_folder": eval_video_folder,
-                "episode_trigger": lambda episode_id: True,
+                # Disable RecordVideo's automatic reset/episode trigger. The evaluator owns the episode
+                # boundaries because it pins one motion and force-resets its frame to zero.
+                "step_trigger": lambda step: False,
                 "video_length": 0,
                 "name_prefix": "eval",
                 "disable_logger": True,
             }
-            print("[INFO] Recording full-episode evaluation videos.")
+            print("[INFO] Recording evaluator-bounded full-episode evaluation videos.")
             print_dict(video_kwargs, nesting=4)
-            env = gym.wrappers.RecordVideo(env, **video_kwargs)
+            env = _EvalRecordVideo(env, **video_kwargs)
             eval_video_renamer = _EvalEpisodeVideoRenamer(env)
         else:
             video_kwargs = {
@@ -442,48 +492,6 @@ def _sanitize_video_stem(value: str) -> str:
     return sanitized or "episode"
 
 
-def _resolve_ffmpeg_executable() -> str | None:
-    try:
-        import imageio_ffmpeg
-
-        return imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:
-        return shutil.which("ffmpeg")
-
-
-def _pad_short_eval_video(video_path: pathlib.Path, tail_seconds: float = SHORT_EVAL_VIDEO_TAIL_SECONDS) -> bool:
-    ffmpeg = _resolve_ffmpeg_executable()
-    if ffmpeg is None:
-        print(f"[WARN] Could not pad short eval video because ffmpeg was not found: {video_path}")
-        return False
-
-    tmp_path = video_path.with_name(f"{video_path.stem}.pad_tmp{video_path.suffix}")
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-i",
-        str(video_path),
-        "-vf",
-        f"tpad=stop_mode=clone:stop_duration={float(tail_seconds):.3f}",
-        "-an",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        str(tmp_path),
-    ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-    if result.returncode != 0 or not tmp_path.exists() or tmp_path.stat().st_size <= 0:
-        if tmp_path.exists():
-            tmp_path.unlink()
-        stderr_tail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown ffmpeg error"
-        print(f"[WARN] Could not pad short eval video {video_path}: {stderr_tail}")
-        return False
-
-    tmp_path.replace(video_path)
-    return True
-
-
 class _EvalEpisodeVideoRenamer:
     def __init__(self, record_video_wrapper):
         self.record_video_wrapper = record_video_wrapper
@@ -498,6 +506,8 @@ class _EvalEpisodeVideoRenamer:
             return
 
         self.video_folder.mkdir(parents=True, exist_ok=True)
+        self.current_video_path = None
+        self.current_metadata_path = None
         self.video_files_before_episode = self._snapshot_video_files()
         # Keep RecordVideo's internal episode state aligned with the evaluator's episode boundary.
         self.record_video_wrapper.terminated = False
@@ -516,10 +526,16 @@ class _EvalEpisodeVideoRenamer:
     def _start_recording(self) -> None:
         self.manual_episode_index += 1
         if hasattr(self.record_video_wrapper, "start_video_recorder"):
-            self.record_video_wrapper.start_video_recorder()
-            return
+            try:
+                self.record_video_wrapper.start_video_recorder()
+                return
+            except AttributeError as exc:
+                print(f"[WARN] start_video_recorder failed; trying alternate RecordVideo API: {exc}")
         if hasattr(self.record_video_wrapper, "start_recording"):
-            self.record_video_wrapper.start_recording(f"eval-manual-episode-{self.manual_episode_index}")
+            try:
+                self.record_video_wrapper.start_recording(f"eval-manual-episode-{self.manual_episode_index}")
+            except TypeError:
+                self.record_video_wrapper.start_recording()
             return
         print("[WARN] RecordVideo wrapper has no known start recording method; video may not align with eval episodes.")
 
@@ -527,10 +543,16 @@ class _EvalEpisodeVideoRenamer:
         if not bool(getattr(self.record_video_wrapper, "recording", False)):
             return
         if hasattr(self.record_video_wrapper, "close_video_recorder"):
-            self.record_video_wrapper.close_video_recorder()
-            return
+            try:
+                self.record_video_wrapper.close_video_recorder()
+                return
+            except AttributeError as exc:
+                print(f"[WARN] close_video_recorder failed; trying alternate RecordVideo API: {exc}")
         if hasattr(self.record_video_wrapper, "stop_recording"):
-            self.record_video_wrapper.stop_recording()
+            try:
+                self.record_video_wrapper.stop_recording()
+            except TypeError:
+                self.record_video_wrapper.stop_recording(None)
             return
 
         video_recorder = getattr(self.record_video_wrapper, "video_recorder", None)
@@ -550,11 +572,7 @@ class _EvalEpisodeVideoRenamer:
         candidates = [path for path in candidates if path.exists()]
         if candidates:
             return candidates[-1]
-
-        all_files = [path for path in self.video_folder.glob("*.mp4") if path.exists()]
-        if not all_files:
-            return None
-        return max(all_files, key=lambda path: path.stat().st_mtime)
+        return None
 
     def finish_episode(self, episode_row: dict) -> None:
         motion_name = _sanitize_video_stem(str(episode_row.get("motion_name", "motion")))
@@ -589,13 +607,6 @@ class _EvalEpisodeVideoRenamer:
         if source_metadata_path is not None and source_metadata_path.exists():
             source_metadata_path.rename(target_path.with_suffix(".meta.json"))
         episode_row["video_file"] = str(target_path.resolve())
-
-        episode_length_steps = int(episode_row.get("episode_length_steps", 0))
-        if 0 < episode_length_steps <= SHORT_EVAL_VIDEO_PAD_STEPS:
-            padded = _pad_short_eval_video(target_path)
-            episode_row["video_padded_for_viewing"] = padded
-            if padded:
-                episode_row["video_padding_tail_seconds"] = SHORT_EVAL_VIDEO_TAIL_SECONDS
 
         self.current_video_path = None
         self.current_metadata_path = None
