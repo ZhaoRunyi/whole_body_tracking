@@ -463,6 +463,12 @@ class _EvalRecordVideo(gym.wrappers.RecordVideo):
             return bool(episode_trigger(int(getattr(self, "episode_id", 0))))
         return False
 
+    def _video_length_limit(self) -> float:
+        try:
+            return float(getattr(self, "video_length", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+
     def _close_eval_recorder(self) -> None:
         if hasattr(self, "close_video_recorder"):
             self.close_video_recorder()
@@ -482,7 +488,7 @@ class _EvalRecordVideo(gym.wrappers.RecordVideo):
         if not (bool(getattr(self, "terminated", False)) or bool(getattr(self, "truncated", False))):
             if bool(getattr(self, "recording", False)):
                 self._capture_eval_frame()
-                video_length = int(getattr(self, "video_length", 0))
+                video_length = self._video_length_limit()
                 if video_length > 0 and self._recorded_frame_count() > video_length:
                     self._close_eval_recorder()
             elif self._eval_video_enabled():
