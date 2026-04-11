@@ -6,6 +6,8 @@ import argparse
 import os
 import pathlib
 import re
+import shutil
+import subprocess
 import sys
 from datetime import datetime
 
@@ -215,6 +217,15 @@ def _validate_motion_npz_file(path: str) -> None:
         raise ValueError(f"Motion file {path} missing keys: {missing}")
 
 
+def _get_motion_duration_seconds(path: str) -> float:
+    with np.load(path, allow_pickle=False) as data:
+        num_steps = int(data["joint_pos"].shape[0])
+        fps = float(np.asarray(data["fps"]).reshape(-1)[0])
+    if fps <= 0.0:
+        raise ValueError(f"Invalid fps={fps} in motion file: {path}")
+    return max(num_steps / fps, 0.0)
+
+
 def _normalize_registry_names(registry_names: list[str]) -> list[str]:
     out: list[str] = []
     for name in registry_names:
@@ -391,6 +402,8 @@ def _disable_termination_terms(
 def _configure_failure_hold_for_evaluation(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     hold_seconds: float,
+    motion_files: list[str],
+    force_full_motion: bool,
 ) -> tuple[int, int | None]:
     if hold_seconds <= 0.0:
         return 0, None
@@ -400,17 +413,24 @@ def _configure_failure_hold_for_evaluation(
         raise ValueError(f"Invalid environment step dt for eval failure hold: {step_dt}")
 
     original_episode_length_s = float(env_cfg.episode_length_s)
-    logical_timeout_steps = max(int(round(original_episode_length_s / step_dt)), 1)
+    longest_motion_s = max((_get_motion_duration_seconds(path) for path in motion_files), default=original_episode_length_s)
     failure_hold_steps = max(int(round(float(hold_seconds) / step_dt)), 1)
+    if force_full_motion:
+        logical_timeout_steps = None
+        base_episode_length_s = max(original_episode_length_s, longest_motion_s)
+    else:
+        logical_timeout_steps = max(int(round(original_episode_length_s / step_dt)), 1)
+        base_episode_length_s = original_episode_length_s
 
     # Env-side failure terminations auto-reset before play.py can record the failure state. Disable them and
     # let the evaluator mark failures manually, then keep stepping for the requested hold window.
     _disable_termination_terms(env_cfg, ("motion_end", "anchor_pos", "anchor_ori", "ee_body_pos"))
-    env_cfg.episode_length_s = original_episode_length_s + float(hold_seconds)
+    env_cfg.episode_length_s = base_episode_length_s + float(hold_seconds)
     print(
         "[INFO] Deferred failure termination enabled: "
         f"hold_seconds={hold_seconds}, hold_steps={failure_hold_steps}, "
-        f"logical_timeout_steps={logical_timeout_steps}, env_episode_length_s={env_cfg.episode_length_s}"
+        f"logical_timeout_steps={logical_timeout_steps}, longest_motion_s={longest_motion_s:.3f}, "
+        f"env_episode_length_s={env_cfg.episode_length_s}"
     )
     return failure_hold_steps, logical_timeout_steps
 
@@ -420,7 +440,10 @@ def _configure_play_visualization(
 ) -> None:
     motion_cfg = getattr(getattr(env_cfg, "commands", None), "motion", None)
     if motion_cfg is not None:
-        motion_cfg.debug_vis = render_refpose and not bool(getattr(args_cli, "headless", False))
+        allow_headless_eval_markers = bool(args_cli.evaluate and args_cli.video)
+        motion_cfg.debug_vis = render_refpose and (
+            not bool(getattr(args_cli, "headless", False)) or allow_headless_eval_markers
+        )
 
     contact_sensor_cfg = getattr(getattr(env_cfg, "scene", None), "contact_forces", None)
     if contact_sensor_cfg is not None:
@@ -594,6 +617,11 @@ def _create_wrapped_env(
         env = multi_agent_to_single_agent(env)
 
     wrapped_env = RslRlVecEnvWrapper(env)
+    try:
+        wrapped_env._base_gym_env = env
+        wrapped_env._render_gym_env = getattr(env, "env", env)
+    except AttributeError:
+        pass
     if eval_video_renamer is not None:
         _EVAL_VIDEO_RENAMERS[id(wrapped_env)] = eval_video_renamer
         try:
@@ -607,6 +635,172 @@ def _sanitize_video_stem(value: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
     sanitized = sanitized.strip("._-")
     return sanitized or "episode"
+
+
+def _resolve_ffmpeg_executable() -> str | None:
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return shutil.which("ffmpeg")
+
+
+def _get_ref_replay_cache_path(motion_file: str) -> pathlib.Path:
+    motion_path = pathlib.Path(motion_file).expanduser().resolve()
+    return motion_path.with_name(f"{motion_path.stem}_ref_replay.mp4")
+
+
+def _get_side_by_side_video_path(video_path: pathlib.Path) -> pathlib.Path:
+    return video_path.with_name(f"{video_path.stem}_side_by_side{video_path.suffix}")
+
+
+def _extract_rgb_frame(frame) -> np.ndarray | None:
+    if frame is None:
+        return None
+    if isinstance(frame, list):
+        if not frame:
+            return None
+        frame = frame[-1]
+    frame_array = np.asarray(frame)
+    if frame_array.size == 0:
+        return None
+    return frame_array
+
+
+def _get_render_gym_env(env):
+    return getattr(env, "_render_gym_env", None) or getattr(env, "_base_gym_env", None)
+
+
+def _generate_reference_motion_video(env, motion_id: int, motion_file: str, output_path: pathlib.Path) -> pathlib.Path | None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and output_path.stat().st_size > 0:
+        return output_path
+
+    render_gym_env = _get_render_gym_env(env)
+    if render_gym_env is None:
+        print(f"[WARN] Cannot generate ref replay video because no render-capable gym env was found: {motion_file}")
+        return None
+
+    try:
+        import imageio.v2 as imageio
+    except Exception as exc:
+        print(f"[WARN] Cannot generate ref replay video because imageio is unavailable: {exc}")
+        return None
+
+    base_env = env.unwrapped
+    motion_command = base_env.command_manager.get_term("motion")
+    device = motion_command.motion_ids.device
+    all_env_ids = torch.arange(int(env.num_envs), device=device, dtype=torch.long)
+    if all_env_ids.numel() != 1:
+        print(f"[WARN] Ref replay cache generation only supports num_envs=1 cleanly. Skipping: {motion_file}")
+        return None
+
+    original_motion_prob = _pin_motion_id(motion_command, int(motion_id))
+    fps = max(int(round(1.0 / max(float(getattr(base_env, "step_dt", _get_env_step_dt(base_env.cfg))), 1e-6))), 1)
+    writer = None
+    try:
+        _reset_env_if_possible(env)
+        motion_command.motion_ids[:] = int(motion_id)
+        num_steps = int(motion_command.motion_lengths[int(motion_id)].item())
+        writer = imageio.get_writer(str(output_path), fps=fps)
+        for time_step in range(num_steps):
+            _force_motion_frame(base_env, motion_command, all_env_ids, time_step=time_step)
+            frame = _extract_rgb_frame(render_gym_env.render())
+            if frame is None:
+                raise RuntimeError(f"render() returned no frame while generating ref replay for {motion_file}")
+            writer.append_data(frame)
+        return output_path
+    except Exception as exc:
+        print(f"[WARN] Failed to generate ref replay video for {motion_file}: {exc}")
+        if output_path.exists():
+            output_path.unlink()
+        return None
+    finally:
+        if writer is not None:
+            writer.close()
+        motion_command.motion_prob = original_motion_prob
+        _reset_env_if_possible(env)
+
+
+def _compose_side_by_side_video(real_video_path: pathlib.Path, ref_video_path: pathlib.Path) -> pathlib.Path | None:
+    ffmpeg = _resolve_ffmpeg_executable()
+    if ffmpeg is None:
+        print(f"[WARN] Cannot compose side-by-side video because ffmpeg was not found: {real_video_path}")
+        return None
+
+    output_path = _get_side_by_side_video_path(real_video_path)
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(real_video_path),
+        "-i",
+        str(ref_video_path),
+        "-filter_complex",
+        (
+            "[0:v]scale=-2:720:force_original_aspect_ratio=decrease[left];"
+            "[1:v]tpad=stop_mode=clone:stop_duration=7200,"
+            "scale=-2:720:force_original_aspect_ratio=decrease[right];"
+            "[left][right]hstack=inputs=2[v]"
+        ),
+        "-map",
+        "[v]",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-shortest",
+        str(output_path),
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    if result.returncode != 0 or not output_path.exists() or output_path.stat().st_size <= 0:
+        if output_path.exists():
+            output_path.unlink()
+        stderr_tail = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "unknown ffmpeg error"
+        print(f"[WARN] Failed to compose side-by-side video for {real_video_path}: {stderr_tail}")
+        return None
+    return output_path
+
+
+def _postprocess_eval_videos(env, result: dict) -> None:
+    if not bool(args_cli.video):
+        return
+
+    episodes = result.get("episodes", [])
+    if not episodes:
+        return
+
+    ref_cache_by_motion_file: dict[str, pathlib.Path | None] = {}
+    motion_file_to_id: dict[str, int] = {}
+    for episode_row in episodes:
+        motion_file = episode_row.get("motion_file")
+        motion_id = episode_row.get("motion_id")
+        if motion_file is None or motion_id is None:
+            continue
+        motion_file_to_id.setdefault(str(motion_file), int(motion_id))
+
+    for motion_file, motion_id in motion_file_to_id.items():
+        ref_cache_path = _get_ref_replay_cache_path(motion_file)
+        if ref_cache_path.exists() and ref_cache_path.stat().st_size > 0:
+            ref_cache_by_motion_file[motion_file] = ref_cache_path
+            continue
+        ref_cache_by_motion_file[motion_file] = _generate_reference_motion_video(env, motion_id, motion_file, ref_cache_path)
+
+    for episode_row in episodes:
+        video_file = episode_row.get("video_file")
+        motion_file = episode_row.get("motion_file")
+        if not video_file or not motion_file:
+            continue
+        real_video_path = pathlib.Path(video_file)
+        ref_video_path = ref_cache_by_motion_file.get(str(motion_file))
+        if ref_video_path is None or not ref_video_path.exists():
+            continue
+        side_by_side_path = _compose_side_by_side_video(real_video_path, ref_video_path)
+        if side_by_side_path is not None:
+            episode_row["ref_video_file"] = str(ref_video_path.resolve())
+            episode_row["side_by_side_video_file"] = str(side_by_side_path.resolve())
 
 
 class _EvalEpisodeVideoRenamer:
@@ -805,7 +999,7 @@ def _run_grouped_evaluation(
         if args_cli.export_onnx:
             _export_policy_artifacts(env, ppo_runner, resume_path)
         video_renamer = _get_eval_episode_video_renamer(env)
-        return evaluate_multi_motion_policy(
+        result = evaluate_multi_motion_policy(
             env=env,
             policy=policy,
             simulation_app=simulation_app,
@@ -818,6 +1012,8 @@ def _run_grouped_evaluation(
             episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
             episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
         )
+        _postprocess_eval_videos(env, result)
+        return result
     finally:
         env.close()
 
@@ -865,6 +1061,7 @@ def _run_separate_motion_evaluation(
                 episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
                 episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
             )
+            _postprocess_eval_videos(env, motion_result)
         finally:
             env.close()
 
@@ -933,6 +1130,7 @@ def _run_separate_motion_evaluation_reuse(
                 episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
                 episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
             )
+            _postprocess_eval_videos(env, motion_result)
 
             total_steps += int(motion_result.get("summary", {}).get("total_steps", 0))
             all_targets_reached = all_targets_reached and bool(
@@ -1024,7 +1222,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.evaluate:
         _configure_motion_sampling_for_evaluation(env_cfg, force_full_motion=args_cli.eval_full_motion)
         failure_hold_steps, logical_timeout_steps = _configure_failure_hold_for_evaluation(
-            env_cfg, hold_seconds=EVAL_FAILURE_HOLD_SECONDS
+            env_cfg,
+            hold_seconds=EVAL_FAILURE_HOLD_SECONDS,
+            motion_files=configured_motion_files,
+            force_full_motion=bool(args_cli.eval_full_motion),
         )
         if args_cli.sampling_strategy and args_cli.eval_full_motion:
             print("[WARN] --sampling_strategy is ignored when --eval_full_motion is enabled.")
