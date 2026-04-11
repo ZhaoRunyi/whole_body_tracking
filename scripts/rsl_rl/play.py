@@ -672,6 +672,20 @@ def _get_render_gym_env(env):
     return getattr(env, "_render_gym_env", None) or getattr(env, "_base_gym_env", None)
 
 
+def _pin_motion_id_for_ref_replay(motion_command, motion_id: int) -> torch.Tensor | None:
+    motion_prob = getattr(motion_command, "motion_prob", None)
+    if not isinstance(motion_prob, torch.Tensor):
+        motion_command.motion_ids[:] = int(motion_id)
+        return None
+
+    original_motion_prob = motion_prob.clone()
+    pinned_prob = torch.zeros_like(motion_prob)
+    pinned_prob[int(motion_id)] = 1.0
+    motion_command.motion_prob = pinned_prob
+    motion_command.motion_ids[:] = int(motion_id)
+    return original_motion_prob
+
+
 def _generate_reference_motion_video(env, motion_id: int, motion_file: str, output_path: pathlib.Path) -> pathlib.Path | None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and output_path.stat().st_size > 0:
@@ -696,7 +710,7 @@ def _generate_reference_motion_video(env, motion_id: int, motion_file: str, outp
         print(f"[WARN] Ref replay cache generation only supports num_envs=1 cleanly. Skipping: {motion_file}")
         return None
 
-    original_motion_prob = _pin_motion_id(motion_command, int(motion_id))
+    original_motion_prob = _pin_motion_id_for_ref_replay(motion_command, int(motion_id))
     fps = max(int(round(1.0 / max(float(getattr(base_env, "step_dt", _get_env_step_dt(base_env.cfg))), 1e-6))), 1)
     writer = None
     try:
@@ -719,7 +733,8 @@ def _generate_reference_motion_video(env, motion_id: int, motion_file: str, outp
     finally:
         if writer is not None:
             writer.close()
-        motion_command.motion_prob = original_motion_prob
+        if original_motion_prob is not None:
+            motion_command.motion_prob = original_motion_prob
         _reset_env_if_possible(env)
 
 
