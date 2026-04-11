@@ -160,7 +160,12 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import whole_body_tracking.tasks  # noqa: F401
 from whole_body_tracking.tasks.tracking.mdp.commands import SAMPLING_PRESET_DEFAULTS
 from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
-from whole_body_tracking.utils.multi_motion_evaluator import evaluate_multi_motion_policy, save_multi_motion_summary
+from whole_body_tracking.utils.multi_motion_evaluator import (
+    _force_motion_frame,
+    _reset_env_if_possible,
+    evaluate_multi_motion_policy,
+    save_multi_motion_summary,
+)
 
 
 REQUIRED_MOTION_KEYS = (
@@ -174,7 +179,7 @@ REQUIRED_MOTION_KEYS = (
 )
 
 _EVAL_VIDEO_RENAMERS = {}
-EVAL_FAILURE_HOLD_SECONDS = 200.0
+EVAL_FAILURE_HOLD_SECONDS = 10.0
 
 SAMPLING_STRATEGY_KEY_ALIASES = {
     "preset": "sampling_preset",
