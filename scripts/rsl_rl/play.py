@@ -3,6 +3,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import json
 import os
 import pathlib
 import re
@@ -229,6 +230,11 @@ def _get_motion_duration_seconds(path: str) -> float:
     if fps <= 0.0:
         raise ValueError(f"Invalid fps={fps} in motion file: {path}")
     return max(num_steps / fps, 0.0)
+
+
+def _get_motion_frame_count(path: str) -> int:
+    with np.load(path, allow_pickle=False) as data:
+        return int(data["joint_pos"].shape[0])
 
 
 def _normalize_registry_names(registry_names: list[str]) -> list[str]:
@@ -656,6 +662,10 @@ def _get_ref_replay_cache_path(motion_file: str) -> pathlib.Path:
     return motion_path.with_name(f"{motion_path.stem}_ref_replay.mp4")
 
 
+def _get_ref_replay_cache_meta_path(output_path: pathlib.Path) -> pathlib.Path:
+    return output_path.with_suffix(".ref_replay.meta.json")
+
+
 def _get_side_by_side_video_path(video_path: pathlib.Path) -> pathlib.Path:
     return video_path.with_name(f"{video_path.stem}_side_by_side{video_path.suffix}")
 
@@ -691,10 +701,88 @@ def _pin_motion_id_for_ref_replay(motion_command, motion_id: int) -> torch.Tenso
     return original_motion_prob
 
 
+def _has_valid_ref_replay_cache(
+    output_path: pathlib.Path,
+    motion_file: str,
+    motion_id: int,
+    expected_frame_count: int,
+) -> bool:
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        return False
+
+    meta_path = _get_ref_replay_cache_meta_path(output_path)
+    if not meta_path.exists():
+        return False
+
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    except Exception:
+        return False
+
+    return (
+        metadata.get("cache_version") == 1
+        and str(metadata.get("motion_file")) == str(pathlib.Path(motion_file).expanduser().resolve())
+        and int(metadata.get("motion_id", -1)) == int(motion_id)
+        and int(metadata.get("frame_count", -1)) == int(expected_frame_count)
+    )
+
+
+def _write_ref_replay_cache_metadata(
+    output_path: pathlib.Path,
+    motion_file: str,
+    motion_id: int,
+    frame_count: int,
+    fps: int,
+) -> None:
+    meta_path = _get_ref_replay_cache_meta_path(output_path)
+    metadata = {
+        "cache_version": 1,
+        "motion_file": str(pathlib.Path(motion_file).expanduser().resolve()),
+        "motion_id": int(motion_id),
+        "frame_count": int(frame_count),
+        "fps": int(fps),
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
+
+
+def _get_video_duration_seconds(video_path: pathlib.Path) -> float | None:
+    try:
+        import imageio.v2 as imageio
+
+        reader = imageio.get_reader(str(video_path))
+        try:
+            metadata = reader.get_meta_data()
+            fps = float(metadata.get("fps", 0.0) or 0.0)
+            if fps <= 0.0:
+                return None
+            try:
+                frame_count = int(reader.count_frames())
+            except Exception:
+                nframes = metadata.get("nframes", None)
+                if nframes in (None, float("inf")):
+                    return None
+                frame_count = int(nframes)
+            if frame_count <= 0:
+                return None
+            return float(frame_count) / fps
+        finally:
+            reader.close()
+    except Exception:
+        return None
+
+
 def _generate_reference_motion_video(env, motion_id: int, motion_file: str, output_path: pathlib.Path) -> pathlib.Path | None:
+    expected_frame_count = _get_motion_frame_count(motion_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.exists() and output_path.stat().st_size > 0:
+    if _has_valid_ref_replay_cache(output_path, motion_file, motion_id, expected_frame_count):
         return output_path
+    if output_path.exists():
+        output_path.unlink()
+    meta_path = _get_ref_replay_cache_meta_path(output_path)
+    if meta_path.exists():
+        meta_path.unlink()
 
     render_gym_env = _get_render_gym_env(env)
     if render_gym_env is None:
@@ -721,7 +809,7 @@ def _generate_reference_motion_video(env, motion_id: int, motion_file: str, outp
     try:
         _reset_env_if_possible(env)
         motion_command.motion_ids[:] = int(motion_id)
-        num_steps = int(motion_command.motion_lengths[int(motion_id)].item())
+        num_steps = expected_frame_count
         writer = imageio.get_writer(str(output_path), fps=fps)
         for time_step in range(num_steps):
             _force_motion_frame(base_env, motion_command, all_env_ids, time_step=time_step)
@@ -729,11 +817,15 @@ def _generate_reference_motion_video(env, motion_id: int, motion_file: str, outp
             if frame is None:
                 raise RuntimeError(f"render() returned no frame while generating ref replay for {motion_file}")
             writer.append_data(frame)
+        _write_ref_replay_cache_metadata(output_path, motion_file, motion_id, num_steps, fps)
         return output_path
     except Exception as exc:
         print(f"[WARN] Failed to generate ref replay video for {motion_file}: {exc}")
         if output_path.exists():
             output_path.unlink()
+        meta_path = _get_ref_replay_cache_meta_path(output_path)
+        if meta_path.exists():
+            meta_path.unlink()
         return None
     finally:
         if writer is not None:
@@ -750,6 +842,22 @@ def _compose_side_by_side_video(real_video_path: pathlib.Path, ref_video_path: p
         return None
 
     output_path = _get_side_by_side_video_path(real_video_path)
+    real_duration_s = _get_video_duration_seconds(real_video_path)
+    if real_duration_s is not None and real_duration_s > 0.0:
+        duration_str = f"{real_duration_s:.6f}"
+        filter_complex = (
+            "[0:v]scale=-2:720:force_original_aspect_ratio=decrease[left];"
+            f"[1:v]tpad=stop_mode=clone:stop_duration={duration_str},"
+            "scale=-2:720:force_original_aspect_ratio=decrease[right];"
+            "[left][right]hstack=inputs=2[vtmp];"
+            f"[vtmp]trim=duration={duration_str}[v]"
+        )
+    else:
+        filter_complex = (
+            "[0:v]scale=-2:720:force_original_aspect_ratio=decrease[left];"
+            "[1:v]scale=-2:720:force_original_aspect_ratio=decrease[right];"
+            "[left][right]hstack=inputs=2:shortest=1[v]"
+        )
     cmd = [
         ffmpeg,
         "-y",
@@ -758,12 +866,7 @@ def _compose_side_by_side_video(real_video_path: pathlib.Path, ref_video_path: p
         "-i",
         str(ref_video_path),
         "-filter_complex",
-        (
-            "[0:v]scale=-2:720:force_original_aspect_ratio=decrease[left];"
-            "[1:v]tpad=stop_mode=clone:stop_duration=7200,"
-            "scale=-2:720:force_original_aspect_ratio=decrease[right];"
-            "[left][right]hstack=inputs=2[v]"
-        ),
+        filter_complex,
         "-map",
         "[v]",
         "-an",
@@ -771,7 +874,6 @@ def _compose_side_by_side_video(real_video_path: pathlib.Path, ref_video_path: p
         "libx264",
         "-pix_fmt",
         "yuv420p",
-        "-shortest",
         str(output_path),
     ]
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
