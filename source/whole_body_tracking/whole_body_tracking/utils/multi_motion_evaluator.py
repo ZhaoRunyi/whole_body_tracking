@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any
 
 import isaaclab.utils.math as math_utils
+import numpy as np
 import torch
 
 
@@ -116,6 +117,126 @@ def _get_body_indexes(motion_command, body_names: list[str] | tuple[str, ...] | 
         return list(range(len(motion_command.cfg.body_names)))
     selected = set(body_names)
     return [idx for idx, name in enumerate(motion_command.cfg.body_names) if name in selected]
+
+
+def _tensor_to_float_list(values: torch.Tensor) -> list[float]:
+    return [float(v) for v in values.detach().cpu().reshape(-1).tolist()]
+
+
+def _build_joint_diagnostics(robot, motion_command, env_id: int) -> dict[str, Any]:
+    ref_joint_pos = motion_command.joint_pos[env_id]
+    actual_joint_pos = motion_command.robot_joint_pos[env_id]
+    joint_diff = actual_joint_pos - ref_joint_pos
+    abs_joint_diff = joint_diff.abs()
+
+    joint_names = list(getattr(robot, "joint_names", []) or [])
+    if len(joint_names) != int(ref_joint_pos.numel()):
+        joint_names = [f"joint_{i}" for i in range(int(ref_joint_pos.numel()))]
+
+    ranked = torch.argsort(abs_joint_diff, descending=True)
+    top_joint_errors = []
+    for joint_idx_tensor in ranked[: min(5, ranked.numel())]:
+        joint_idx = int(joint_idx_tensor.item())
+        top_joint_errors.append(
+            {
+                "joint_name": joint_names[joint_idx],
+                "joint_index": joint_idx,
+                "ref": float(ref_joint_pos[joint_idx].item()),
+                "actual": float(actual_joint_pos[joint_idx].item()),
+                "diff": float(joint_diff[joint_idx].item()),
+                "abs_diff": float(abs_joint_diff[joint_idx].item()),
+            }
+        )
+
+    return {
+        "joint_names": joint_names,
+        "ref_joint_pos": _tensor_to_float_list(ref_joint_pos),
+        "actual_joint_pos": _tensor_to_float_list(actual_joint_pos),
+        "joint_pos_diff": _tensor_to_float_list(joint_diff),
+        "top_abs_joint_pos_errors": top_joint_errors,
+    }
+
+
+def _build_failure_details_for_env(base_env, motion_command, env_id: int, reason: str) -> dict[str, Any]:
+    robot = base_env.scene["robot"]
+    details: dict[str, Any] = {
+        "reason": reason,
+        "env_id": int(env_id),
+        "motion_id": int(motion_command.motion_ids[env_id].item()),
+        "time_step": int(motion_command.time_steps[env_id].item()),
+        "joint_diagnostics": _build_joint_diagnostics(robot, motion_command, env_id),
+    }
+
+    if reason == "anchor_pos":
+        threshold = float(_get_termination_param(base_env, "anchor_pos", "threshold", 0.25))
+        ref_pos = motion_command.anchor_pos_w[env_id]
+        actual_pos = motion_command.robot_anchor_pos_w[env_id]
+        diff = actual_pos - ref_pos
+        details["anchor_pos"] = {
+            "threshold": threshold,
+            "ref_pos_w": _tensor_to_float_list(ref_pos),
+            "actual_pos_w": _tensor_to_float_list(actual_pos),
+            "diff_xyz": _tensor_to_float_list(diff),
+            "abs_diff_z": float(diff[-1].abs().item()),
+            "diff_norm": float(torch.linalg.vector_norm(diff).item()),
+        }
+    elif reason == "anchor_ori":
+        threshold = float(_get_termination_param(base_env, "anchor_ori", "threshold", 0.8))
+        motion_projected_gravity_b = math_utils.quat_rotate_inverse(motion_command.anchor_quat_w, robot.data.GRAVITY_VEC_W)[env_id]
+        robot_projected_gravity_b = math_utils.quat_rotate_inverse(motion_command.robot_anchor_quat_w, robot.data.GRAVITY_VEC_W)[env_id]
+        details["anchor_ori"] = {
+            "threshold": threshold,
+            "ref_anchor_quat_w": _tensor_to_float_list(motion_command.anchor_quat_w[env_id]),
+            "actual_anchor_quat_w": _tensor_to_float_list(motion_command.robot_anchor_quat_w[env_id]),
+            "ref_projected_gravity_b": _tensor_to_float_list(motion_projected_gravity_b),
+            "actual_projected_gravity_b": _tensor_to_float_list(robot_projected_gravity_b),
+            "abs_diff_z": float((motion_projected_gravity_b[2] - robot_projected_gravity_b[2]).abs().item()),
+            "quat_error_magnitude": float(math_utils.quat_error_magnitude(
+                motion_command.anchor_quat_w[env_id : env_id + 1], motion_command.robot_anchor_quat_w[env_id : env_id + 1]
+            )[0].item()),
+        }
+    elif reason == "ee_body_pos":
+        threshold = float(_get_termination_param(base_env, "ee_body_pos", "threshold", 0.25))
+        ee_body_names = _get_termination_param(base_env, "ee_body_pos", "body_names", DEFAULT_EE_BODY_NAMES)
+        ee_body_indexes = _get_body_indexes(motion_command, ee_body_names)
+        links = []
+        violated_links = []
+        worst_link = None
+        worst_abs_diff_z = -1.0
+        for body_index in ee_body_indexes:
+            body_name = motion_command.cfg.body_names[body_index]
+            ref_pos = motion_command.body_pos_relative_w[env_id, body_index]
+            actual_pos = motion_command.robot_body_pos_w[env_id, body_index]
+            diff = actual_pos - ref_pos
+            abs_diff_z = float(diff[-1].abs().item())
+            violated = abs_diff_z > threshold
+            link_row = {
+                "body_name": body_name,
+                "body_index": int(body_index),
+                "threshold": threshold,
+                "ref_pos_w": _tensor_to_float_list(ref_pos),
+                "actual_pos_w": _tensor_to_float_list(actual_pos),
+                "diff_xyz": _tensor_to_float_list(diff),
+                "abs_diff_z": abs_diff_z,
+                "diff_norm": float(torch.linalg.vector_norm(diff).item()),
+                "violated": violated,
+            }
+            links.append(link_row)
+            if violated:
+                violated_links.append(body_name)
+            if abs_diff_z > worst_abs_diff_z:
+                worst_abs_diff_z = abs_diff_z
+                worst_link = link_row
+
+        details["ee_body_pos"] = {
+            "threshold": threshold,
+            "body_names": list(ee_body_names),
+            "violated_links": violated_links,
+            "worst_link": worst_link,
+            "links": links,
+        }
+
+    return details
 
 
 def _compute_episode_reason_masks(base_env, motion_command, timeout_mask: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -476,6 +597,7 @@ def evaluate_multi_motion_policy(
     logical_timeout_steps: int | None = None,
     episode_start_callback=None,
     episode_callback=None,
+    failure_frame_callback=None,
 ) -> dict[str, Any]:
     if target_episodes_per_motion <= 0:
         raise ValueError("target_episodes_per_motion must be > 0.")
@@ -538,6 +660,8 @@ def evaluate_multi_motion_policy(
     episode_metric_sums: dict[str, torch.Tensor] = {}
     pending_failure = torch.zeros(num_envs, dtype=torch.bool, device=device)
     failure_reason_by_env = ["" for _ in range(num_envs)]
+    failure_details_by_env: list[dict[str, Any] | None] = [None for _ in range(num_envs)]
+    failure_frame_by_env: list[np.ndarray | None] = [None for _ in range(num_envs)]
     failure_length = torch.zeros(num_envs, dtype=torch.long, device=device)
     failure_return = torch.zeros(num_envs, dtype=torch.float32, device=device)
     failure_metric_sums: dict[str, torch.Tensor] = {}
@@ -587,13 +711,23 @@ def evaluate_multi_motion_policy(
             pending_failure[new_failure_env_ids] = True
             failure_length[new_failure_env_ids] = episode_length[new_failure_env_ids]
             failure_return[new_failure_env_ids] = episode_return[new_failure_env_ids]
+            captured_failure_frame = None
+            if failure_frame_callback is not None:
+                try:
+                    captured_failure_frame = failure_frame_callback()
+                except Exception:
+                    captured_failure_frame = None
             for metric_name, metric_accumulator in episode_metric_sums.items():
                 if metric_name not in failure_metric_sums:
                     failure_metric_sums[metric_name] = torch.zeros(num_envs, dtype=torch.float32, device=device)
                 failure_metric_sums[metric_name][new_failure_env_ids] = metric_accumulator[new_failure_env_ids]
             for env_id_tensor in new_failure_env_ids:
                 env_id = int(env_id_tensor.item())
-                failure_reason_by_env[env_id] = _select_reason_for_env(reason_masks, env_id)
+                failure_reason = _select_reason_for_env(reason_masks, env_id)
+                failure_reason_by_env[env_id] = failure_reason
+                failure_details_by_env[env_id] = _build_failure_details_for_env(base_env, motion_command, env_id, failure_reason)
+                if captured_failure_frame is not None:
+                    failure_frame_by_env[env_id] = np.asarray(captured_failure_frame).copy()
 
         held_failure_done_mask = pending_failure & ((episode_length - failure_length) >= failure_hold_steps)
         natural_success_mask = (reason_masks["motion_end"] | timeout_mask) & (~pending_failure)
@@ -647,6 +781,7 @@ def evaluate_multi_motion_policy(
             for local_idx, motion_id in enumerate(done_motion_ids):
                 if int(motion_id) not in tracked_motion_index:
                     continue
+                env_id = int(done_env_ids[local_idx].item())
                 local_motion_id = tracked_motion_index[int(motion_id)]
                 outcome = done_outcomes[local_idx]
                 episode_number = aggregator.add_episode(
@@ -679,6 +814,10 @@ def evaluate_multi_motion_policy(
                 if failure_detected_steps[local_idx] is not None:
                     episode_row["failure_detected_step"] = int(failure_detected_steps[local_idx])
                     episode_row["failure_hold_steps"] = int(video_lengths[local_idx] - done_lengths[local_idx])
+                    if failure_details_by_env[env_id] is not None:
+                        episode_row["failure_details"] = failure_details_by_env[env_id]
+                    if failure_frame_by_env[env_id] is not None:
+                        episode_row["_failure_frame_rgb"] = failure_frame_by_env[env_id]
                 episode_rows.append(episode_row)
                 status = "SUCCESS" if episode_row["success"] else "FAIL"
                 print(
@@ -699,7 +838,10 @@ def evaluate_multi_motion_policy(
             failure_length[done_env_ids] = 0
             failure_return[done_env_ids] = 0.0
             for env_id_tensor in done_env_ids:
-                failure_reason_by_env[int(env_id_tensor.item())] = ""
+                env_id = int(env_id_tensor.item())
+                failure_reason_by_env[env_id] = ""
+                failure_details_by_env[env_id] = None
+                failure_frame_by_env[env_id] = None
             for metric_accumulator in episode_metric_sums.values():
                 metric_accumulator[done_env_ids] = 0.0
             for metric_accumulator in failure_metric_sums.values():

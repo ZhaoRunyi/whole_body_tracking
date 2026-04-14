@@ -687,6 +687,31 @@ def _get_render_gym_env(env):
     return getattr(env, "_render_gym_env", None) or getattr(env, "_base_gym_env", None)
 
 
+def _capture_eval_render_frame(env) -> np.ndarray | None:
+    render_gym_env = _get_render_gym_env(env)
+    if render_gym_env is None:
+        return None
+    try:
+        return _extract_rgb_frame(render_gym_env.render())
+    except Exception:
+        return None
+
+
+def _set_motion_command_marker_visibility(motion_command, visible: bool) -> None:
+    for attr_name in ("current_anchor_visualizer", "goal_anchor_visualizer"):
+        visualizer = getattr(motion_command, attr_name, None)
+        if visualizer is not None and hasattr(visualizer, "set_visibility"):
+            visualizer.set_visibility(bool(visible))
+
+    for attr_name in ("current_body_visualizers", "goal_body_visualizers"):
+        visualizers = getattr(motion_command, attr_name, None)
+        if visualizers is None:
+            continue
+        for visualizer in visualizers:
+            if visualizer is not None and hasattr(visualizer, "set_visibility"):
+                visualizer.set_visibility(bool(visible))
+
+
 def _pin_motion_id_for_ref_replay(motion_command, motion_id: int) -> torch.Tensor | None:
     motion_prob = getattr(motion_command, "motion_prob", None)
     if not isinstance(motion_prob, torch.Tensor):
@@ -721,7 +746,7 @@ def _has_valid_ref_replay_cache(
         return False
 
     return (
-        metadata.get("cache_version") == 1
+        metadata.get("cache_version") == 2
         and str(metadata.get("motion_file")) == str(pathlib.Path(motion_file).expanduser().resolve())
         and int(metadata.get("motion_id", -1)) == int(motion_id)
         and int(metadata.get("frame_count", -1)) == int(expected_frame_count)
@@ -737,7 +762,7 @@ def _write_ref_replay_cache_metadata(
 ) -> None:
     meta_path = _get_ref_replay_cache_meta_path(output_path)
     metadata = {
-        "cache_version": 1,
+        "cache_version": 2,
         "motion_file": str(pathlib.Path(motion_file).expanduser().resolve()),
         "motion_id": int(motion_id),
         "frame_count": int(frame_count),
@@ -806,6 +831,7 @@ def _generate_reference_motion_video(env, motion_id: int, motion_file: str, outp
     original_motion_prob = _pin_motion_id_for_ref_replay(motion_command, int(motion_id))
     fps = max(int(round(1.0 / max(float(getattr(base_env, "step_dt", _get_env_step_dt(base_env.cfg))), 1e-6))), 1)
     writer = None
+    _set_motion_command_marker_visibility(motion_command, False)
     try:
         _reset_env_if_possible(env)
         motion_command.motion_ids[:] = int(motion_id)
@@ -832,6 +858,7 @@ def _generate_reference_motion_video(env, motion_id: int, motion_file: str, outp
             writer.close()
         if original_motion_prob is not None:
             motion_command.motion_prob = original_motion_prob
+        _set_motion_command_marker_visibility(motion_command, True)
         _reset_env_if_possible(env)
 
 
@@ -905,9 +932,6 @@ def _postprocess_eval_videos(env, result: dict) -> None:
 
     for motion_file, motion_id in motion_file_to_id.items():
         ref_cache_path = _get_ref_replay_cache_path(motion_file)
-        if ref_cache_path.exists() and ref_cache_path.stat().st_size > 0:
-            ref_cache_by_motion_file[motion_file] = ref_cache_path
-            continue
         ref_cache_by_motion_file[motion_file] = _generate_reference_motion_video(env, motion_id, motion_file, ref_cache_path)
 
     for episode_row in episodes:
@@ -921,8 +945,15 @@ def _postprocess_eval_videos(env, result: dict) -> None:
             continue
         side_by_side_path = _compose_side_by_side_video(real_video_path, ref_video_path)
         if side_by_side_path is not None:
+            side_by_side_resolved = str(side_by_side_path.resolve())
             episode_row["ref_video_file"] = str(ref_video_path.resolve())
-            episode_row["side_by_side_video_file"] = str(side_by_side_path.resolve())
+            episode_row["side_by_side_video_file"] = side_by_side_resolved
+            episode_row["video_file"] = side_by_side_resolved
+            raw_meta_path = real_video_path.with_suffix(".meta.json")
+            if raw_meta_path.exists():
+                raw_meta_path.unlink()
+            if real_video_path.exists():
+                real_video_path.unlink()
 
 
 class _EvalEpisodeVideoRenamer:
@@ -1041,6 +1072,27 @@ class _EvalEpisodeVideoRenamer:
             source_metadata_path.rename(target_path.with_suffix(".meta.json"))
         episode_row["video_file"] = str(target_path.resolve())
 
+        failure_frame_rgb = episode_row.pop("_failure_frame_rgb", None)
+        if failure_frame_rgb is not None:
+            try:
+                import imageio.v2 as imageio
+
+                failure_frame_path = target_path.with_name(f"{target_path.stem}_failure_frame.png")
+                imageio.imwrite(str(failure_frame_path), np.asarray(failure_frame_rgb))
+                episode_row["failure_frame_file"] = str(failure_frame_path.resolve())
+            except Exception as exc:
+                print(f"[WARN] Failed to write failure frame image for {target_path}: {exc}")
+
+        failure_details = episode_row.get("failure_details")
+        if failure_details is not None:
+            failure_detail_path = target_path.with_name(f"{target_path.stem}_failure_detail.json")
+            try:
+                with open(failure_detail_path, "w", encoding="utf-8") as f:
+                    json.dump(failure_details, f, indent=2, sort_keys=True)
+                episode_row["failure_detail_file"] = str(failure_detail_path.resolve())
+            except Exception as exc:
+                print(f"[WARN] Failed to write failure detail JSON for {target_path}: {exc}")
+
         self.current_video_path = None
         self.current_metadata_path = None
         self.video_files_before_episode = set()
@@ -1133,6 +1185,7 @@ def _run_grouped_evaluation(
             logical_timeout_steps=logical_timeout_steps,
             episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
             episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
+            failure_frame_callback=lambda: _capture_eval_render_frame(env),
         )
         _postprocess_eval_videos(env, result)
         return result
@@ -1182,6 +1235,7 @@ def _run_separate_motion_evaluation(
                 logical_timeout_steps=logical_timeout_steps,
                 episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
                 episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
+                failure_frame_callback=lambda: _capture_eval_render_frame(env),
             )
             _postprocess_eval_videos(env, motion_result)
         finally:
@@ -1251,6 +1305,7 @@ def _run_separate_motion_evaluation_reuse(
                 logical_timeout_steps=logical_timeout_steps,
                 episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
                 episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
+                failure_frame_callback=lambda: _capture_eval_render_frame(env),
             )
             _postprocess_eval_videos(env, motion_result)
 
