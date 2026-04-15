@@ -107,6 +107,30 @@ parser.add_argument(
     default=None,
     help="Load a checkpoint directly from a local .pt path and continue training from it.",
 )
+parser.add_argument(
+    "--ewc_enable",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Enable EWC regularization on top of ER fine-tuning.",
+)
+parser.add_argument(
+    "--ewc_lambda",
+    type=float,
+    default=1.0,
+    help="EWC penalty scale.",
+)
+parser.add_argument(
+    "--ewc_fisher_batches",
+    type=int,
+    default=5,
+    help="Number of replay mini-batches used to estimate the EWC diagonal Fisher matrix.",
+)
+parser.add_argument(
+    "--ewc_actor_only",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Apply EWC to actor/policy parameters only.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -148,6 +172,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 # Import extensions to set up environment tasks
 import whole_body_tracking.tasks  # noqa: F401
 from whole_body_tracking.tasks.tracking.mdp.commands import SAMPLING_PRESET_DEFAULTS
+from whole_body_tracking.utils.ewc_vecenv_wrapper import EwcReplayMaskRslRlVecEnvWrapper
 from whole_body_tracking.utils.my_on_policy_runner import MotionOnPolicyRunner as OnPolicyRunner
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -378,6 +403,23 @@ def _resolve_direct_checkpoint_path(path: str | None) -> str | None:
     return checkpoint_path
 
 
+def _validate_ewc_configuration(
+    *,
+    er_motion_file: str | list[str] | None,
+    num_envs: int,
+    er_primary_env_fraction: float,
+    has_resume_checkpoint: bool,
+) -> None:
+    if er_motion_file is None:
+        raise ValueError("EWC requires ER replay motions. Provide one of --er_registry_name, --er_local_dir, or --er_local_file.")
+    if num_envs < 2:
+        raise ValueError("EWC requires at least 2 environments so primary and replay pools can coexist.")
+    if not 0.0 < float(er_primary_env_fraction) < 1.0:
+        raise ValueError("EWC requires --er_primary_env_fraction to be strictly between 0 and 1.")
+    if not has_resume_checkpoint:
+        raise ValueError("EWC requires a pretrained checkpoint. Use --local_ckpt or --resume/--load_run/--checkpoint.")
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
@@ -413,6 +455,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     registry_names = registry_names + er_registry_names
     _apply_sampling_strategy(env_cfg, args_cli.sampling_strategy)
     _configure_training_visualization(env_cfg, args_cli.render_refpose)
+    direct_resume_path = _resolve_direct_checkpoint_path(args_cli.local_ckpt)
+    if direct_resume_path is not None and agent_cfg.resume:
+        raise ValueError("Use either --local_ckpt or --resume/--load_run/--checkpoint, not both.")
+    if args_cli.ewc_enable:
+        has_resume_checkpoint = bool(direct_resume_path is not None or agent_cfg.resume)
+        _validate_ewc_configuration(
+            er_motion_file=er_motion_file,
+            num_envs=int(env_cfg.scene.num_envs),
+            er_primary_env_fraction=float(args_cli.er_primary_env_fraction),
+            has_resume_checkpoint=has_resume_checkpoint,
+        )
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -443,7 +496,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = multi_agent_to_single_agent(env)
 
     # wrap around environment for rsl-rl
-    env = RslRlVecEnvWrapper(env)
+    if args_cli.ewc_enable:
+        env = EwcReplayMaskRslRlVecEnvWrapper(env)
+    else:
+        env = RslRlVecEnvWrapper(env)
 
     # create runner from rsl-rl
     runner = OnPolicyRunner(
@@ -452,9 +508,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner.configure_refpose_logging(args_cli.print_refpose)
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
-    direct_resume_path = _resolve_direct_checkpoint_path(args_cli.local_ckpt)
-    if direct_resume_path is not None and agent_cfg.resume:
-        raise ValueError("Use either --local_ckpt or --resume/--load_run/--checkpoint, not both.")
 
     # save resume path before creating a new log_dir
     if direct_resume_path is not None:
@@ -466,6 +519,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+    if args_cli.ewc_enable:
+        runner.enable_ewc(
+            ewc_lambda=args_cli.ewc_lambda,
+            ewc_fisher_batches=args_cli.ewc_fisher_batches,
+            ewc_actor_only=args_cli.ewc_actor_only,
+        )
+        runner.capture_ewc_reference_from_current_policy()
+        print(
+            "[INFO] EWC enabled: "
+            f"ewc_lambda={args_cli.ewc_lambda}, "
+            f"ewc_fisher_batches={args_cli.ewc_fisher_batches}, "
+            f"ewc_actor_only={args_cli.ewc_actor_only}"
+        )
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

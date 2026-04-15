@@ -9,6 +9,7 @@ from isaaclab_rl.rsl_rl import export_policy_as_onnx
 
 import torch
 import wandb
+from whole_body_tracking.utils.ewc_regularizer import EwcConfig, PolicyEwcRegularizer
 from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
 
 
@@ -37,6 +38,8 @@ class MotionOnPolicyRunner(OnPolicyRunner):
         self.registry_names = list(registry_name) if registry_name is not None else []
         self.refpose_print_num_envs = 0
         self._motion_source_labels: list[str] | None = None
+        self.ewc_regularizer: PolicyEwcRegularizer | None = None
+        self._ewc_update_wrapped = False
 
     def save(self, path: str, infos=None):
         """Save the model and training information."""
@@ -58,6 +61,57 @@ class MotionOnPolicyRunner(OnPolicyRunner):
 
     def configure_refpose_logging(self, num_envs: int) -> None:
         self.refpose_print_num_envs = max(int(num_envs), 0)
+
+    def enable_ewc(
+        self,
+        *,
+        ewc_lambda: float,
+        ewc_fisher_batches: int,
+        ewc_actor_only: bool,
+    ) -> None:
+        if not hasattr(self.env, "consume_ewc_replay_mask_rollout"):
+            raise AttributeError(
+                "EWC requires an env wrapper exposing consume_ewc_replay_mask_rollout(). "
+                "Use EwcReplayMaskRslRlVecEnvWrapper when EWC is enabled."
+            )
+
+        self.ewc_regularizer = PolicyEwcRegularizer(
+            EwcConfig(
+                enable=True,
+                lambda_=ewc_lambda,
+                fisher_batches=ewc_fisher_batches,
+                actor_only=ewc_actor_only,
+            )
+        )
+        self._wrap_alg_update_for_ewc()
+
+    def capture_ewc_reference_from_current_policy(self) -> None:
+        if self.ewc_regularizer is None:
+            return
+        self.ewc_regularizer.capture_reference(self.alg.policy)
+
+    def _wrap_alg_update_for_ewc(self) -> None:
+        if self._ewc_update_wrapped:
+            return
+
+        original_update = self.alg.update
+
+        def wrapped_update(*args, **kwargs):
+            if self.ewc_regularizer is not None and not self.ewc_regularizer.fisher_ready:
+                replay_mask_rollout = self.env.consume_ewc_replay_mask_rollout()
+                self.ewc_regularizer.estimate_fisher_from_rollout(self.alg, replay_mask_rollout)
+            elif hasattr(self.env, "consume_ewc_replay_mask_rollout"):
+                self.env.consume_ewc_replay_mask_rollout()
+
+            update_result = original_update(*args, **kwargs)
+
+            if self.ewc_regularizer is not None:
+                self.ewc_regularizer.apply_penalty_step(self.alg)
+
+            return update_result
+
+        self.alg.update = wrapped_update
+        self._ewc_update_wrapped = True
 
     def _get_motion_command(self):
         env = getattr(self.env, "unwrapped", self.env)
@@ -145,6 +199,8 @@ class MotionOnPolicyRunner(OnPolicyRunner):
 
         for key, value in locs["loss_dict"].items():
             self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
+        if self.ewc_regularizer is not None and self.ewc_regularizer.reference_ready:
+            self.writer.add_scalar("Loss/ewc_penalty", self.ewc_regularizer.last_penalty, locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
@@ -175,6 +231,8 @@ class MotionOnPolicyRunner(OnPolicyRunner):
             )
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f"Mean {key} loss:":>{pad}} {value:.4f}\n"""
+            if self.ewc_regularizer is not None and self.ewc_regularizer.reference_ready:
+                log_string += f"""{'EWC penalty:':>{pad}} {self.ewc_regularizer.last_penalty:.4f}\n"""
             if self.alg.rnd:
                 log_string += (
                     f"""{'Mean extrinsic reward:':>{pad}} {statistics.mean(locs['erewbuffer']):.2f}\n"""
@@ -191,6 +249,8 @@ class MotionOnPolicyRunner(OnPolicyRunner):
             )
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
+            if self.ewc_regularizer is not None and self.ewc_regularizer.reference_ready:
+                log_string += f"""{'EWC penalty:':>{pad}} {self.ewc_regularizer.last_penalty:.4f}\n"""
 
         log_string += ep_string
         log_string += self._build_refpose_summary(pad)

@@ -588,6 +588,7 @@ def evaluate_multi_motion_policy(
     policy,
     simulation_app,
     target_episodes_per_motion: int,
+    single_episode_per_env: bool = False,
     max_steps: int | None = None,
     print_interval: int = 200,
     force_full_motion_from_start: bool = False,
@@ -667,6 +668,7 @@ def evaluate_multi_motion_policy(
     failure_metric_sums: dict[str, torch.Tensor] = {}
     previous_actions = None
     episode_rows: list[dict[str, Any]] = []
+    completed_first_episode = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
     total_steps = 0
     stop_reason = "simulation_stopped"
@@ -675,6 +677,9 @@ def evaluate_multi_motion_policy(
         with torch.no_grad():
             current_motion_ids = motion_command.motion_ids.clone()
             actions = policy(obs)
+            if single_episode_per_env and torch.any(completed_first_episode):
+                actions = actions.clone()
+                actions[completed_first_episode] = 0.0
             step_metrics = _collect_step_metrics(motion_command, actions, previous_actions, robot, contact_sensor)
             if not episode_metric_sums:
                 episode_metric_sums = {
@@ -732,6 +737,8 @@ def evaluate_multi_motion_policy(
         held_failure_done_mask = pending_failure & ((episode_length - failure_length) >= failure_hold_steps)
         natural_success_mask = (reason_masks["motion_end"] | timeout_mask) & (~pending_failure)
         done_mask = env_done_mask | natural_success_mask | held_failure_done_mask
+        if single_episode_per_env:
+            done_mask &= ~completed_first_episode
         done_env_ids = done_mask.nonzero(as_tuple=False).flatten()
         if done_env_ids.numel() > 0:
             done_motion_ids = current_motion_ids[done_env_ids].detach().cpu().tolist()
@@ -832,6 +839,8 @@ def evaluate_multi_motion_policy(
                 if episode_callback is not None:
                     episode_callback(episode_row)
 
+            if single_episode_per_env:
+                completed_first_episode[done_env_ids] = True
             episode_return[done_env_ids] = 0.0
             episode_length[done_env_ids] = 0
             pending_failure[done_env_ids] = False
@@ -847,16 +856,17 @@ def evaluate_multi_motion_policy(
             for metric_accumulator in failure_metric_sums.values():
                 metric_accumulator[done_env_ids] = 0.0
 
-            manual_done_env_ids = done_env_ids[(~env_done_mask[done_env_ids]).nonzero(as_tuple=False).flatten()]
-            if manual_done_env_ids.numel() > 0:
-                _reset_env_ids_if_possible(env, base_env, manual_done_env_ids)
-            if force_full_motion_from_start:
-                if pinned_motion_id is not None:
-                    motion_command.motion_ids[done_env_ids] = int(pinned_motion_id)
-                _force_motion_frame(base_env, motion_command, done_env_ids, time_step=0)
-                obs, _ = env.get_observations()
-            if episode_start_callback is not None and not aggregator.is_target_reached():
-                episode_start_callback()
+            if not single_episode_per_env:
+                manual_done_env_ids = done_env_ids[(~env_done_mask[done_env_ids]).nonzero(as_tuple=False).flatten()]
+                if manual_done_env_ids.numel() > 0:
+                    _reset_env_ids_if_possible(env, base_env, manual_done_env_ids)
+                if force_full_motion_from_start:
+                    if pinned_motion_id is not None:
+                        motion_command.motion_ids[done_env_ids] = int(pinned_motion_id)
+                    _force_motion_frame(base_env, motion_command, done_env_ids, time_step=0)
+                    obs, _ = env.get_observations()
+                if episode_start_callback is not None and not aggregator.is_target_reached():
+                    episode_start_callback()
 
         previous_actions = actions.detach()
         total_steps += 1
@@ -864,6 +874,9 @@ def evaluate_multi_motion_policy(
         if print_interval > 0 and total_steps % print_interval == 0:
             print(f"[EVAL] step={total_steps} | {aggregator.progress_line()}")
 
+        if single_episode_per_env and bool(torch.all(completed_first_episode).item()):
+            stop_reason = "all_envs_completed_first_episode"
+            break
         if aggregator.is_target_reached():
             stop_reason = "targets_reached"
             break
@@ -875,6 +888,7 @@ def evaluate_multi_motion_policy(
     result["episodes"] = episode_rows
     result["config"] = {
         "target_episodes_per_motion": int(target_episodes_per_motion),
+        "single_episode_per_env": bool(single_episode_per_env),
         "max_steps": max_steps,
         "print_interval": int(print_interval),
         "force_full_motion_from_start": bool(force_full_motion_from_start),
@@ -883,6 +897,7 @@ def evaluate_multi_motion_policy(
         "logical_timeout_steps": logical_timeout_steps,
         "tracked_motion_ids": tracked_motion_ids,
         "motion_files": [os.path.abspath(all_motion_files[motion_id]) for motion_id in tracked_motion_ids],
+        "completed_first_episode_env_count": int(completed_first_episode.sum().item()),
     }
     if original_motion_prob is not None:
         motion_command.motion_prob = original_motion_prob

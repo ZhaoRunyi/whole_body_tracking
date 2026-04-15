@@ -87,6 +87,15 @@ parser.add_argument(
     help="Target completed episodes per motion in evaluation mode.",
 )
 parser.add_argument(
+    "--eval_single_episode_per_env",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help=(
+        "When enabled, each environment contributes at most one evaluation episode. "
+        "Fast environments wait after finishing instead of starting a second counted episode."
+    ),
+)
+parser.add_argument(
     "--eval_max_steps",
     type=int,
     default=None,
@@ -1178,6 +1187,7 @@ def _run_grouped_evaluation(
             policy=policy,
             simulation_app=simulation_app,
             target_episodes_per_motion=args_cli.eval_episodes_per_motion,
+            single_episode_per_env=args_cli.eval_single_episode_per_env,
             max_steps=args_cli.eval_max_steps,
             print_interval=args_cli.eval_print_interval,
             force_full_motion_from_start=args_cli.eval_full_motion,
@@ -1228,6 +1238,7 @@ def _run_separate_motion_evaluation(
                 policy=policy,
                 simulation_app=simulation_app,
                 target_episodes_per_motion=args_cli.eval_episodes_per_motion,
+                single_episode_per_env=args_cli.eval_single_episode_per_env,
                 max_steps=args_cli.eval_max_steps,
                 print_interval=args_cli.eval_print_interval,
                 force_full_motion_from_start=args_cli.eval_full_motion,
@@ -1296,6 +1307,7 @@ def _run_separate_motion_evaluation_reuse(
                 policy=policy,
                 simulation_app=simulation_app,
                 target_episodes_per_motion=args_cli.eval_episodes_per_motion,
+                single_episode_per_env=args_cli.eval_single_episode_per_env,
                 max_steps=args_cli.eval_max_steps,
                 print_interval=args_cli.eval_print_interval,
                 force_full_motion_from_start=args_cli.eval_full_motion,
@@ -1408,6 +1420,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print("[WARN] --sampling_strategy is ignored when --eval_full_motion is enabled.")
         elif args_cli.sampling_strategy:
             _apply_sampling_strategy(env_cfg, args_cli.sampling_strategy)
+        if args_cli.eval_single_episode_per_env and args_cli.eval_episodes_per_motion < int(env_cfg.scene.num_envs):
+            print(
+                "[INFO] --eval_single_episode_per_env requires enough target episodes to count one first episode per env. "
+                f"Overriding --eval_episodes_per_motion from {args_cli.eval_episodes_per_motion} "
+                f"to {int(env_cfg.scene.num_envs)}."
+            )
+            args_cli.eval_episodes_per_motion = int(env_cfg.scene.num_envs)
     elif args_cli.sampling_strategy:
         _apply_sampling_strategy(env_cfg, args_cli.sampling_strategy)
     _configure_play_visualization(env_cfg, args_cli.render_refpose)
@@ -1454,6 +1473,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "motion_files": configured_motion_files,
                 "eval_mode": resolved_eval_mode,
                 "eval_full_motion": args_cli.eval_full_motion,
+                "eval_single_episode_per_env": args_cli.eval_single_episode_per_env,
                 "eval_failure_hold_seconds": EVAL_FAILURE_HOLD_SECONDS,
                 "eval_failure_hold_steps": int(failure_hold_steps),
                 "eval_logical_timeout_steps": logical_timeout_steps,
