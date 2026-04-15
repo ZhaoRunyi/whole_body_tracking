@@ -70,6 +70,12 @@ parser.add_argument(
     default=None,
     help="Read a single local *.npz motion file.",
 )
+parser.add_argument(
+    "--local_ckpt",
+    type=str,
+    default=None,
+    help="Load a checkpoint directly from a local .pt path and continue training from it.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -288,6 +294,18 @@ def _resolve_motion_files() -> tuple[str | list[str], list[str]]:
     return (motion_files[0] if len(motion_files) == 1 else motion_files), registry_names
 
 
+def _resolve_direct_checkpoint_path(path: str | None) -> str | None:
+    if path is None:
+        return None
+
+    checkpoint_path = str(Path(path).expanduser().resolve())
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+    if not checkpoint_path.endswith(".pt"):
+        raise ValueError(f"--local_ckpt must point to a .pt file: {checkpoint_path}")
+    return checkpoint_path
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
@@ -346,8 +364,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner.configure_refpose_logging(args_cli.print_refpose)
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
+    direct_resume_path = _resolve_direct_checkpoint_path(args_cli.local_ckpt)
+    if direct_resume_path is not None and agent_cfg.resume:
+        raise ValueError("Use either --local_ckpt or --resume/--load_run/--checkpoint, not both.")
+
     # save resume path before creating a new log_dir
-    if agent_cfg.resume:
+    if direct_resume_path is not None:
+        print(f"[INFO]: Loading model checkpoint from direct path: {direct_resume_path}")
+        runner.load(direct_resume_path)
+    elif agent_cfg.resume:
         # get path to previous checkpoint
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
