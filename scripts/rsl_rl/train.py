@@ -64,6 +64,12 @@ parser.add_argument(
     default=None,
     help="Recursively read all *.npz motions from local directory.",
 )
+parser.add_argument(
+    "--local_file",
+    type=str,
+    default=None,
+    help="Read a single local *.npz motion file.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -259,8 +265,17 @@ def _download_motion_npz_list(registry_names: list[str]) -> list[str]:
 def _resolve_motion_files() -> tuple[str | list[str], list[str]]:
     has_registry = bool(args_cli.registry_name)
     has_local_dir = bool(args_cli.local_dir)
-    if has_registry == has_local_dir:
-        raise ValueError("Provide exactly one of --registry_name or --local_dir.")
+    has_local_file = bool(args_cli.local_file)
+    num_sources = sum((has_registry, has_local_dir, has_local_file))
+    if num_sources != 1:
+        raise ValueError("Provide exactly one of --registry_name, --local_dir, or --local_file.")
+
+    if has_local_file:
+        motion_file = str(Path(args_cli.local_file).expanduser().resolve())
+        if not os.path.isfile(motion_file):
+            raise FileNotFoundError(f"Motion file not found: {motion_file}")
+        _validate_motion_npz_file(motion_file)
+        return motion_file, []
 
     if has_local_dir:
         motion_files = _iter_motion_npz_files(args_cli.local_dir)
