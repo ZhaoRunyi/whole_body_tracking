@@ -71,6 +71,37 @@ parser.add_argument(
     help="Read a single local *.npz motion file.",
 )
 parser.add_argument(
+    "--er_registry_name",
+    type=str,
+    nargs="+",
+    default=None,
+    help="One or more wandb motion registries (space-separated) for replay motions.",
+)
+parser.add_argument(
+    "--er_local_dir",
+    type=str,
+    default=None,
+    help="Recursively read all *.npz replay motions from local directory.",
+)
+parser.add_argument(
+    "--er_local_file",
+    type=str,
+    default=None,
+    help="Read a single local *.npz replay motion file.",
+)
+parser.add_argument(
+    "--er_primary_env_fraction",
+    type=float,
+    default=0.5,
+    help="Fraction of environments assigned to the primary motion pool when ER replay motions are enabled.",
+)
+parser.add_argument(
+    "--er_shuffle_seed",
+    type=int,
+    default=0,
+    help="Base seed used to reshuffle env -> {primary,replay} pool assignment on episode reset.",
+)
+parser.add_argument(
     "--local_ckpt",
     type=str,
     default=None,
@@ -268,30 +299,71 @@ def _download_motion_npz_list(registry_names: list[str]) -> list[str]:
     return out
 
 
-def _resolve_motion_files() -> tuple[str | list[str], list[str]]:
-    has_registry = bool(args_cli.registry_name)
-    has_local_dir = bool(args_cli.local_dir)
-    has_local_file = bool(args_cli.local_file)
+def _resolve_motion_source(
+    registry_names: list[str] | None,
+    local_dir: str | None,
+    local_file: str | None,
+    *,
+    registry_flag: str,
+    local_dir_flag: str,
+    local_file_flag: str,
+    allow_empty: bool,
+) -> tuple[str | list[str] | None, list[str]]:
+    has_registry = bool(registry_names)
+    has_local_dir = bool(local_dir)
+    has_local_file = bool(local_file)
     num_sources = sum((has_registry, has_local_dir, has_local_file))
+
+    if num_sources == 0:
+        if allow_empty:
+            return None, []
+        raise ValueError(f"Provide exactly one of {registry_flag}, {local_dir_flag}, or {local_file_flag}.")
+
     if num_sources != 1:
-        raise ValueError("Provide exactly one of --registry_name, --local_dir, or --local_file.")
+        raise ValueError(f"Provide exactly one of {registry_flag}, {local_dir_flag}, or {local_file_flag}.")
 
     if has_local_file:
-        motion_file = str(Path(args_cli.local_file).expanduser().resolve())
+        motion_file = str(Path(local_file).expanduser().resolve())
         if not os.path.isfile(motion_file):
             raise FileNotFoundError(f"Motion file not found: {motion_file}")
         _validate_motion_npz_file(motion_file)
         return motion_file, []
 
     if has_local_dir:
-        motion_files = _iter_motion_npz_files(args_cli.local_dir)
+        motion_files = _iter_motion_npz_files(local_dir)
         for motion_file in motion_files:
             _validate_motion_npz_file(motion_file)
         return (motion_files[0] if len(motion_files) == 1 else motion_files), []
 
-    registry_names = _normalize_registry_names(args_cli.registry_name)
-    motion_files = _download_motion_npz_list(registry_names)
-    return (motion_files[0] if len(motion_files) == 1 else motion_files), registry_names
+    normalized_registry_names = _normalize_registry_names(registry_names)
+    motion_files = _download_motion_npz_list(normalized_registry_names)
+    return (motion_files[0] if len(motion_files) == 1 else motion_files), normalized_registry_names
+
+
+def _resolve_motion_files() -> tuple[str | list[str], list[str]]:
+    motion_files, registry_names = _resolve_motion_source(
+        args_cli.registry_name,
+        args_cli.local_dir,
+        args_cli.local_file,
+        registry_flag="--registry_name",
+        local_dir_flag="--local_dir",
+        local_file_flag="--local_file",
+        allow_empty=False,
+    )
+    assert motion_files is not None
+    return motion_files, registry_names
+
+
+def _resolve_er_motion_files() -> tuple[str | list[str] | None, list[str]]:
+    return _resolve_motion_source(
+        args_cli.er_registry_name,
+        args_cli.er_local_dir,
+        args_cli.er_local_file,
+        registry_flag="--er_registry_name",
+        local_dir_flag="--er_local_dir",
+        local_file_flag="--er_local_file",
+        allow_empty=True,
+    )
 
 
 def _resolve_direct_checkpoint_path(path: str | None) -> str | None:
@@ -322,7 +394,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     # load one or more motion files from wandb registry or local recursive directory
     motion_file, registry_names = _resolve_motion_files()
+    er_motion_file, er_registry_names = _resolve_er_motion_files()
     env_cfg.commands.motion.motion_file = motion_file
+    env_cfg.commands.motion.er_motion_file = er_motion_file
+    env_cfg.commands.motion.er_primary_env_fraction = args_cli.er_primary_env_fraction
+    env_cfg.commands.motion.er_shuffle_seed = args_cli.er_shuffle_seed
+    if er_motion_file is not None:
+        if not 0.0 <= float(args_cli.er_primary_env_fraction) <= 1.0:
+            raise ValueError(
+                f"--er_primary_env_fraction must be in [0, 1], got {args_cli.er_primary_env_fraction}."
+            )
+        er_motion_count = len(er_motion_file) if isinstance(er_motion_file, list) else 1
+        print(
+            "[INFO] Experience replay motions enabled: "
+            f"{er_motion_count} file(s), er_primary_env_fraction={args_cli.er_primary_env_fraction}, "
+            f"er_shuffle_seed={args_cli.er_shuffle_seed}"
+        )
+    registry_names = registry_names + er_registry_names
     _apply_sampling_strategy(env_cfg, args_cli.sampling_strategy)
     _configure_training_visualization(env_cfg, args_cli.render_refpose)
 

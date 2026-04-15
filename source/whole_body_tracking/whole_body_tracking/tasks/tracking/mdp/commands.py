@@ -88,6 +88,59 @@ class MotionLoader:
         return sample
 
 
+def _normalize_motion_file_list(motion_files: str | list[str] | None, field_name: str) -> list[str]:
+    if motion_files is None:
+        return []
+    if isinstance(motion_files, str):
+        motion_files = [motion_files]
+    normalized = [os.path.abspath(os.path.expanduser(path)) for path in motion_files if path]
+    if any(not os.path.isfile(path) for path in normalized):
+        missing = [path for path in normalized if not os.path.isfile(path)]
+        raise FileNotFoundError(f"{field_name} contains invalid paths: {missing}")
+    return normalized
+
+
+def _build_motion_probabilities(
+    num_motions: int,
+    sampling_mode: str,
+    motion_weights: list[float] | None,
+    device: torch.device,
+    weight_field_name: str,
+) -> torch.Tensor:
+    if num_motions <= 0:
+        return torch.zeros(0, dtype=torch.float32, device=device)
+
+    if sampling_mode not in ("uniform", "weighted"):
+        raise ValueError(f"Unsupported motion_sampling: {sampling_mode}")
+
+    if sampling_mode == "weighted":
+        if motion_weights is None or len(motion_weights) != num_motions:
+            raise ValueError(f"{weight_field_name} must match number of motion files when using weighted sampling.")
+        prob = torch.tensor(motion_weights, dtype=torch.float32, device=device)
+        if torch.any(prob < 0) or float(prob.sum().item()) <= 0.0:
+            raise ValueError(f"{weight_field_name} must be non-negative and sum to a positive value.")
+        return prob / prob.sum()
+
+    return torch.ones(num_motions, dtype=torch.float32, device=device) / float(num_motions)
+
+
+def _split_primary_replay_counts(num_envs: int, primary_fraction: float) -> tuple[int, int]:
+    if num_envs <= 0:
+        return 0, 0
+
+    n_primary = int(round(num_envs * float(primary_fraction)))
+    n_primary = min(max(n_primary, 0), num_envs)
+    n_replay = num_envs - n_primary
+
+    if num_envs >= 2:
+        if n_primary == 0:
+            n_primary, n_replay = 1, num_envs - 1
+        if n_replay == 0:
+            n_primary, n_replay = num_envs - 1, 1
+
+    return n_primary, n_replay
+
+
 class MotionCommand(CommandTerm):
     cfg: MotionCommandCfg
 
@@ -101,16 +154,18 @@ class MotionCommand(CommandTerm):
             self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0], dtype=torch.long, device=self.device
         )
 
-        motion_files = self.cfg.motion_file
-        if isinstance(motion_files, str):
-            motion_files = [motion_files]
-        if len(motion_files) == 0:
+        self.primary_motion_files = _normalize_motion_file_list(self.cfg.motion_file, "motion_file")
+        if len(self.primary_motion_files) == 0:
             raise ValueError("motion_file cannot be empty.")
-        self.motion_files = [os.path.abspath(path) for path in motion_files]
+        self.replay_motion_files = _normalize_motion_file_list(self.cfg.er_motion_file, "er_motion_file")
+        self.er_enabled = len(self.replay_motion_files) > 0
+        if not 0.0 <= float(self.cfg.er_primary_env_fraction) <= 1.0:
+            raise ValueError(f"er_primary_env_fraction must be in [0, 1], got {self.cfg.er_primary_env_fraction}.")
+        self.motion_files = self.primary_motion_files + self.replay_motion_files
 
         motion_storage_device = self.cfg.motion_storage_device
         if motion_storage_device is None:
-            motion_storage_device = "cpu" if len(motion_files) > 1 else self.device
+            motion_storage_device = "cpu" if len(self.motion_files) > 1 else self.device
 
         self.motions = [
             MotionLoader(path, self.body_indexes.detach().cpu().tolist(), device=motion_storage_device)
@@ -119,23 +174,49 @@ class MotionCommand(CommandTerm):
         # Keep compatibility for legacy code paths (e.g. exporter).
         self.motion = self.motions[0]
         self.num_motions = len(self.motions)
+        self.num_primary_motions = len(self.primary_motion_files)
+        self.num_replay_motions = len(self.replay_motion_files)
+        self.primary_motion_ids = torch.arange(self.num_primary_motions, dtype=torch.long, device=self.device)
+        self.replay_motion_ids = torch.arange(
+            self.num_primary_motions,
+            self.num_primary_motions + self.num_replay_motions,
+            dtype=torch.long,
+            device=self.device,
+        )
         self.motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.motion_lengths = torch.tensor([m.time_step_total for m in self.motions], dtype=torch.long, device=self.device)
         self._refpose_log_events: list[dict[str, int | str]] = []
         self._resample_reason = "unknown"
+        self.er_env_is_replay = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._er_shuffle_counter = 0
 
-        if self.cfg.motion_sampling not in ("uniform", "weighted"):
-            raise ValueError(f"Unsupported motion_sampling: {self.cfg.motion_sampling}")
-        if self.cfg.motion_sampling == "weighted":
-            if self.cfg.motion_weights is None or len(self.cfg.motion_weights) != self.num_motions:
-                raise ValueError("motion_weights must match number of motion files when using weighted sampling.")
-            prob = torch.tensor(self.cfg.motion_weights, dtype=torch.float32, device=self.device)
-            self.motion_prob = prob / prob.sum()
-        else:
-            self.motion_prob = torch.ones(self.num_motions, dtype=torch.float32, device=self.device) / float(
-                self.num_motions
-            )
+        self.primary_motion_prob = _build_motion_probabilities(
+            self.num_primary_motions,
+            self.cfg.motion_sampling,
+            self.cfg.motion_weights,
+            self.device,
+            "motion_weights",
+        )
+        self.replay_motion_prob = _build_motion_probabilities(
+            self.num_replay_motions,
+            self.cfg.motion_sampling,
+            self.cfg.er_motion_weights,
+            self.device,
+            "er_motion_weights",
+        )
+        self.motion_prob = torch.zeros(self.num_motions, dtype=torch.float32, device=self.device)
+        self.motion_prob[self.primary_motion_ids] = self.primary_motion_prob
+        if self.er_enabled:
+            self.motion_prob[self.replay_motion_ids] = self.replay_motion_prob
+        self.motion_prob = self.motion_prob / self.motion_prob.sum()
         self._resolve_sampling_policy(env)
+
+        if self.er_enabled:
+            print(
+                "[INFO] Motion ER enabled: "
+                f"primary_motions={self.num_primary_motions}, replay_motions={self.num_replay_motions}, "
+                f"er_primary_env_fraction={self.cfg.er_primary_env_fraction}"
+            )
 
         self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.motion_ended = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -232,6 +313,18 @@ class MotionCommand(CommandTerm):
     @property
     def command(self) -> torch.Tensor:  # TODO Consider again if this is the best observation
         return torch.cat([self.joint_pos, self.joint_vel], dim=1)
+
+    @property
+    def er_replay_env_ids(self) -> torch.Tensor:
+        if not self.er_enabled:
+            return torch.zeros(0, dtype=torch.long, device=self.device)
+        return torch.where(self.er_env_is_replay)[0]
+
+    @property
+    def er_primary_env_ids(self) -> torch.Tensor:
+        if not self.er_enabled:
+            return torch.arange(self.num_envs, dtype=torch.long, device=self.device)
+        return torch.where(~self.er_env_is_replay)[0]
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
         self._resample_reason = "episode_reset"
@@ -377,6 +470,39 @@ class MotionCommand(CommandTerm):
         self.metrics["sampling_top1_prob"][env_ids] = 0.0
         self.metrics["sampling_top1_bin"][env_ids] = 0.0
 
+    def _assign_er_env_pools(self, env_ids: torch.Tensor) -> None:
+        if not self.er_enabled or env_ids.numel() == 0:
+            return
+
+        n_primary, n_replay = _split_primary_replay_counts(env_ids.numel(), self.cfg.er_primary_env_fraction)
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(int(self.cfg.er_shuffle_seed) + self._er_shuffle_counter)
+        self._er_shuffle_counter += 1
+
+        perm = env_ids[torch.randperm(env_ids.numel(), device=self.device, generator=generator)]
+        self.er_env_is_replay[perm[:n_primary]] = False
+        self.er_env_is_replay[perm[n_primary : n_primary + n_replay]] = True
+
+    def _sample_motion_ids_from_active_pool(self, env_ids: torch.Tensor) -> None:
+        if env_ids.numel() == 0:
+            return
+
+        if not self.er_enabled:
+            self.motion_ids[env_ids] = torch.multinomial(self.primary_motion_prob, env_ids.numel(), replacement=True)
+            return
+
+        replay_mask = self.er_env_is_replay[env_ids]
+        primary_env_ids = env_ids[~replay_mask]
+        replay_env_ids = env_ids[replay_mask]
+
+        if primary_env_ids.numel() > 0:
+            sampled = torch.multinomial(self.primary_motion_prob, primary_env_ids.numel(), replacement=True)
+            self.motion_ids[primary_env_ids] = self.primary_motion_ids[sampled]
+
+        if replay_env_ids.numel() > 0:
+            sampled = torch.multinomial(self.replay_motion_prob, replay_env_ids.numel(), replacement=True)
+            self.motion_ids[replay_env_ids] = self.replay_motion_ids[sampled]
+
     def _sample_uniform_full_motion_legacy(self, env_ids: torch.Tensor) -> None:
         max_steps = self.motion_lengths[self.motion_ids[env_ids]]
         random_uniform = torch.rand(len(env_ids), dtype=torch.float32, device=self.device)
@@ -518,8 +644,10 @@ class MotionCommand(CommandTerm):
         env_ids_tensor = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         previous_motion_ids = self.motion_ids[env_ids].clone()
         previous_time_steps = self.time_steps[env_ids].clone()
+        if self.er_enabled and self._resample_reason == "episode_reset":
+            self._assign_er_env_pools(env_ids_tensor)
         if self._should_resample_motion_ids():
-            self.motion_ids[env_ids_tensor] = torch.multinomial(self.motion_prob, len(env_ids), replacement=True)
+            self._sample_motion_ids_from_active_pool(env_ids_tensor)
         self.motion_ended[env_ids_tensor] = False
         self._adaptive_sampling(env_ids_tensor)
         self._record_refpose_resample_events(env_ids_tensor, previous_motion_ids, previous_time_steps)
@@ -673,6 +801,7 @@ class MotionCommandCfg(CommandTermCfg):
     asset_name: str = MISSING
 
     motion_file: str | list[str] = MISSING
+    er_motion_file: str | list[str] | None = None
     anchor_body_name: str = MISSING
     body_names: list[str] = MISSING
 
@@ -685,6 +814,9 @@ class MotionCommandCfg(CommandTermCfg):
     motion_end_behavior: str | None = None
     motion_sampling: str = "uniform"
     motion_weights: list[float] | None = None
+    er_motion_weights: list[float] | None = None
+    er_primary_env_fraction: float = 0.5
+    er_shuffle_seed: int = 0
     lock_motion_per_episode: bool = True
     motion_storage_device: str | None = None
 
