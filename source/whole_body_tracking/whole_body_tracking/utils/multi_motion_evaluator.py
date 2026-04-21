@@ -43,6 +43,20 @@ DEFAULT_EE_BODY_NAMES = (
     "left_wrist_yaw_link",
     "right_wrist_yaw_link",
 )
+DEFAULT_HOVER_GRAVITY_LIMIT_ANGLE = 1.0
+DEFAULT_HOVER_UNDESIRED_CONTACT_BODY_NAMES = (
+    "pelvis",
+    "torso_link",
+    "left_hip_yaw_link",
+    "right_hip_yaw_link",
+    "left_hip_roll_link",
+    "right_hip_roll_link",
+    "left_hip_pitch_link",
+    "right_hip_pitch_link",
+    "left_knee_link",
+    "right_knee_link",
+)
+DEFAULT_HOVER_UNDESIRED_CONTACT_FORCE_THRESHOLD = 1.0
 
 
 def make_motion_labels(motion_files: list[str]) -> list[str]:
@@ -197,6 +211,11 @@ def _get_hover_threshold(base_env, attr_name: str, default: float) -> float:
     return float(default if value is None else value)
 
 
+def _resolve_body_ids_from_names(body_names: list[str], selected_body_names: list[str] | tuple[str, ...]) -> list[int]:
+    index_by_name = {name: idx for idx, name in enumerate(body_names)}
+    return [int(index_by_name[name]) for name in selected_body_names if name in index_by_name]
+
+
 def _get_latest_contact_forces(contact_sensor) -> torch.Tensor | None:
     sensor_data = getattr(contact_sensor, "data", None)
     if sensor_data is None:
@@ -218,6 +237,11 @@ def _get_latest_contact_forces(contact_sensor) -> torch.Tensor | None:
 
 
 def _resolve_undesired_contact_body_ids(base_env, contact_sensor) -> list[int]:
+    hover_body_names = _get_contact_body_names(base_env, contact_sensor)
+    resolved_hover_ids = _resolve_body_ids_from_names(hover_body_names, DEFAULT_HOVER_UNDESIRED_CONTACT_BODY_NAMES)
+    if resolved_hover_ids:
+        return resolved_hover_ids
+
     rewards_cfg = getattr(getattr(base_env, "cfg", None), "rewards", None)
     undesired_contacts_cfg = getattr(rewards_cfg, "undesired_contacts", None) if rewards_cfg is not None else None
     params = getattr(undesired_contacts_cfg, "params", None)
@@ -341,22 +365,22 @@ def _build_failure_details_for_env(base_env, motion_command, env_id: int, reason
             "links": links,
         }
     elif reason == "gravity":
-        gravity_x_threshold = _get_hover_threshold(base_env, "gravity_x_threshold", 0.7)
-        gravity_y_threshold = _get_hover_threshold(base_env, "gravity_y_threshold", 0.7)
         projected_gravity_b = robot.data.projected_gravity_b[env_id]
+        gravity_limit_angle = _get_hover_threshold(base_env, "gravity_limit_angle", DEFAULT_HOVER_GRAVITY_LIMIT_ANGLE)
+        projected_gravity_z = float(torch.clamp(-projected_gravity_b[2], min=-1.0, max=1.0).item())
+        tilt_angle = float(torch.acos(torch.tensor(projected_gravity_z, device=projected_gravity_b.device)).item())
         details["gravity"] = {
-            "gravity_x_threshold": gravity_x_threshold,
-            "gravity_y_threshold": gravity_y_threshold,
+            "gravity_limit_angle": gravity_limit_angle,
             "actual_projected_gravity_b": _tensor_to_float_list(projected_gravity_b),
-            "abs_projected_gravity_xy": [
-                float(projected_gravity_b[0].abs().item()),
-                float(projected_gravity_b[1].abs().item()),
-            ],
-            "exceeds_x": bool(projected_gravity_b[0].abs().item() > gravity_x_threshold),
-            "exceeds_y": bool(projected_gravity_b[1].abs().item() > gravity_y_threshold),
+            "abs_projected_gravity_xy": [float(projected_gravity_b[0].abs().item()), float(projected_gravity_b[1].abs().item())],
+            "tilt_angle_rad": tilt_angle,
+            "tilt_angle_deg": float(np.degrees(tilt_angle)),
+            "violated": bool(tilt_angle > gravity_limit_angle),
         }
     elif reason == "undesired_contact":
-        contact_force_threshold = 1.0
+        contact_force_threshold = _get_hover_threshold(
+            base_env, "hover_undesired_contact_threshold", DEFAULT_HOVER_UNDESIRED_CONTACT_FORCE_THRESHOLD
+        )
         latest_forces = _get_latest_contact_forces(contact_sensor)
         undesired_body_ids = _resolve_undesired_contact_body_ids(base_env, contact_sensor)
         contact_body_names = _get_contact_body_names(base_env, contact_sensor)
@@ -385,6 +409,7 @@ def _build_failure_details_for_env(base_env, motion_command, env_id: int, reason
                     worst_body = body_row
         details["undesired_contact"] = {
             "threshold": contact_force_threshold,
+            "configured_body_names": list(DEFAULT_HOVER_UNDESIRED_CONTACT_BODY_NAMES),
             "violated_bodies": violated_bodies,
             "worst_body": worst_body,
             "bodies": bodies,
@@ -456,14 +481,14 @@ def _compute_episode_reason_masks(base_env, motion_command, timeout_mask: torch.
     else:
         ee_body_pos_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
-    gravity_x_threshold = _get_hover_threshold(base_env, "gravity_x_threshold", 0.7)
-    gravity_y_threshold = _get_hover_threshold(base_env, "gravity_y_threshold", 0.7)
     projected_gravity_b = robot.data.projected_gravity_b
-    gravity_mask = (projected_gravity_b[:, 0].abs() > gravity_x_threshold) | (
-        projected_gravity_b[:, 1].abs() > gravity_y_threshold
-    )
+    gravity_limit_angle = _get_hover_threshold(base_env, "gravity_limit_angle", DEFAULT_HOVER_GRAVITY_LIMIT_ANGLE)
+    gravity_tilt_angle = torch.acos(torch.clamp(-projected_gravity_b[:, 2], min=-1.0, max=1.0))
+    gravity_mask = gravity_tilt_angle > gravity_limit_angle
 
-    contact_force_threshold = 1.0
+    contact_force_threshold = _get_hover_threshold(
+        base_env, "hover_undesired_contact_threshold", DEFAULT_HOVER_UNDESIRED_CONTACT_FORCE_THRESHOLD
+    )
     latest_forces = _get_latest_contact_forces(contact_sensor)
     undesired_body_ids = _resolve_undesired_contact_body_ids(base_env, contact_sensor)
     if latest_forces is not None and undesired_body_ids:
