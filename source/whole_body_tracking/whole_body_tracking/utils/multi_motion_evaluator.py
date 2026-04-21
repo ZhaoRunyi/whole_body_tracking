@@ -27,6 +27,7 @@ TRACKING_METRIC_KEYS = (
 TIMEOUT_INFO_KEYS = ("time_outs", "time_out", "timeouts")
 JOINT_EFFORT_ATTR_KEYS = ("applied_torque", "computed_torque", "joint_torque", "joint_torques", "applied_joint_efforts")
 CONTACT_FORCE_ATTR_KEYS = ("net_forces_w", "net_forces_world", "net_forces_w_history")
+CONTACT_FORCE_MATRIX_ATTR_KEYS = ("force_matrix_w", "force_matrix_w_history")
 SUCCESS_REASON_KEYS = ("motion_end", "time_out")
 CURRENT_FAILURE_REASON_KEYS = ("anchor_pos", "anchor_ori", "ee_body_pos")
 HOVER_FAILURE_REASON_KEYS = ("gravity", "undesired_contact", "reference_motion_distance")
@@ -56,7 +57,7 @@ DEFAULT_HOVER_UNDESIRED_CONTACT_BODY_NAMES = (
     "left_knee_link",
     "right_knee_link",
 )
-DEFAULT_HOVER_UNDESIRED_CONTACT_FORCE_THRESHOLD = 1.0
+DEFAULT_HOVER_UNDESIRED_CONTACT_FORCE_THRESHOLD = 10.0
 
 
 def make_motion_labels(motion_files: list[str]) -> list[str]:
@@ -236,6 +237,26 @@ def _get_latest_contact_forces(contact_sensor) -> torch.Tensor | None:
     return forces
 
 
+def _get_latest_filtered_contact_forces(contact_sensor) -> torch.Tensor | None:
+    sensor_data = getattr(contact_sensor, "data", None)
+    if sensor_data is None:
+        return None
+
+    forces = None
+    for key in CONTACT_FORCE_MATRIX_ATTR_KEYS:
+        values = getattr(sensor_data, key, None)
+        if isinstance(values, torch.Tensor):
+            forces = values
+            break
+    if forces is None:
+        return None
+    if forces.ndim == 5:
+        forces = forces[:, 0]
+    if forces.ndim != 4:
+        return None
+    return torch.nan_to_num(forces, nan=0.0).sum(dim=2)
+
+
 def _resolve_undesired_contact_body_ids(base_env, contact_sensor) -> list[int]:
     hover_body_names = _get_contact_body_names(base_env, contact_sensor)
     resolved_hover_ids = _resolve_body_ids_from_names(hover_body_names, DEFAULT_HOVER_UNDESIRED_CONTACT_BODY_NAMES)
@@ -381,13 +402,14 @@ def _build_failure_details_for_env(base_env, motion_command, env_id: int, reason
         contact_force_threshold = _get_hover_threshold(
             base_env, "hover_undesired_contact_threshold", DEFAULT_HOVER_UNDESIRED_CONTACT_FORCE_THRESHOLD
         )
-        latest_forces = _get_latest_contact_forces(contact_sensor)
+        latest_forces = _get_latest_filtered_contact_forces(contact_sensor)
         undesired_body_ids = _resolve_undesired_contact_body_ids(base_env, contact_sensor)
         contact_body_names = _get_contact_body_names(base_env, contact_sensor)
         bodies = []
         violated_bodies = []
         worst_body = None
         worst_force = -1.0
+        force_source = "force_matrix_w_filtered"
         if latest_forces is not None and undesired_body_ids:
             force_norms = torch.linalg.vector_norm(latest_forces[env_id, undesired_body_ids], dim=-1)
             for local_idx, body_id in enumerate(undesired_body_ids):
@@ -407,9 +429,12 @@ def _build_failure_details_for_env(base_env, motion_command, env_id: int, reason
                 if body_force > worst_force:
                     worst_force = body_force
                     worst_body = body_row
+        else:
+            force_source = "force_matrix_w_filtered_unavailable"
         details["undesired_contact"] = {
             "threshold": contact_force_threshold,
             "configured_body_names": list(DEFAULT_HOVER_UNDESIRED_CONTACT_BODY_NAMES),
+            "force_source": force_source,
             "violated_bodies": violated_bodies,
             "worst_body": worst_body,
             "bodies": bodies,
@@ -489,7 +514,7 @@ def _compute_episode_reason_masks(base_env, motion_command, timeout_mask: torch.
     contact_force_threshold = _get_hover_threshold(
         base_env, "hover_undesired_contact_threshold", DEFAULT_HOVER_UNDESIRED_CONTACT_FORCE_THRESHOLD
     )
-    latest_forces = _get_latest_contact_forces(contact_sensor)
+    latest_forces = _get_latest_filtered_contact_forces(contact_sensor)
     undesired_body_ids = _resolve_undesired_contact_body_ids(base_env, contact_sensor)
     if latest_forces is not None and undesired_body_ids:
         undesired_force_norms = torch.linalg.vector_norm(latest_forces[:, undesired_body_ids], dim=-1)

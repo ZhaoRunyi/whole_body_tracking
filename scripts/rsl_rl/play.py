@@ -26,6 +26,7 @@ EVAL_FAILURE_REASON_KEY_CHOICES = (
     "undesired_contact",
     "reference_motion_distance",
 )
+EVAL_HOVER_CONTACT_FILTER_PRIMS = ("/World/ground",)
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Play or evaluate an RL agent with RSL-RL.")
@@ -506,6 +507,34 @@ def _parse_eval_failure_reason_override(spec: str | None) -> list[str] | None:
     if not reasons:
         raise ValueError("--eval_failure_reasons cannot be empty when provided.")
     return reasons
+
+
+def _resolve_eval_failure_reasons_from_cli() -> tuple[str, ...]:
+    override = _parse_eval_failure_reason_override(args_cli.eval_failure_reasons)
+    if override is not None:
+        return tuple(override)
+    return tuple(FAILURE_REASON_PRESETS[args_cli.eval_failure_reason_preset])
+
+
+def _configure_eval_contact_sensor_for_failure_reasons(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+) -> None:
+    if not bool(args_cli.evaluate):
+        return
+
+    active_failure_reasons = _resolve_eval_failure_reasons_from_cli()
+    if "undesired_contact" not in active_failure_reasons:
+        return
+
+    contact_sensor_cfg = getattr(getattr(env_cfg, "scene", None), "contact_forces", None)
+    if contact_sensor_cfg is None:
+        return
+
+    contact_sensor_cfg.filter_prim_paths_expr = list(EVAL_HOVER_CONTACT_FILTER_PRIMS)
+    print(
+        "[INFO] Configured eval contact sensor for filtered external contacts: "
+        f"filter_prim_paths_expr={list(EVAL_HOVER_CONTACT_FILTER_PRIMS)}"
+    )
 
 
 def _as_first_done(done_value) -> bool:
@@ -1474,6 +1503,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     elif args_cli.sampling_strategy:
         _apply_sampling_strategy(env_cfg, args_cli.sampling_strategy)
     _configure_play_visualization(env_cfg, args_cli.render_refpose)
+    _configure_eval_contact_sensor_for_failure_reasons(env_cfg)
 
     video_enabled = bool(args_cli.video)
     if args_cli.evaluate and video_enabled and env_cfg.scene.num_envs != 1:
