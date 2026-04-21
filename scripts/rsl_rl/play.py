@@ -125,6 +125,23 @@ parser.add_argument(
     help="When enabled, each evaluation episode starts from frame 0 of the motion and runs the whole motion.",
 )
 parser.add_argument(
+    "--eval_failure_reason_preset",
+    type=str,
+    choices=tuple(sorted(FAILURE_REASON_PRESETS)),
+    default="current",
+    help="Preset failure reason set used by the evaluator.",
+)
+parser.add_argument(
+    "--eval_failure_reasons",
+    type=str,
+    default=None,
+    help=(
+        "Optional comma-separated failure reason override. "
+        f"Valid reasons: {', '.join(SUPPORTED_FAILURE_REASON_KEYS)}. "
+        "When provided, this overrides --eval_failure_reason_preset."
+    ),
+)
+parser.add_argument(
     "--export_onnx",
     action=argparse.BooleanOptionalAction,
     default=True,
@@ -171,6 +188,8 @@ import whole_body_tracking.tasks  # noqa: F401
 from whole_body_tracking.tasks.tracking.mdp.commands import SAMPLING_PRESET_DEFAULTS
 from whole_body_tracking.utils.exporter import attach_onnx_metadata, export_motion_policy_as_onnx
 from whole_body_tracking.utils.multi_motion_evaluator import (
+    FAILURE_REASON_PRESETS,
+    SUPPORTED_FAILURE_REASON_KEYS,
     _force_motion_frame,
     _reset_env_if_possible,
     evaluate_multi_motion_policy,
@@ -468,6 +487,15 @@ def _configure_play_visualization(
     contact_sensor_cfg = getattr(getattr(env_cfg, "scene", None), "contact_forces", None)
     if contact_sensor_cfg is not None:
         contact_sensor_cfg.debug_vis = False
+
+
+def _parse_eval_failure_reason_override(spec: str | None) -> list[str] | None:
+    if spec is None:
+        return None
+    reasons = [token.strip() for token in str(spec).split(",") if token.strip()]
+    if not reasons:
+        raise ValueError("--eval_failure_reasons cannot be empty when provided.")
+    return reasons
 
 
 def _as_first_done(done_value) -> bool:
@@ -1193,6 +1221,8 @@ def _run_grouped_evaluation(
             force_full_motion_from_start=args_cli.eval_full_motion,
             failure_hold_steps=failure_hold_steps,
             logical_timeout_steps=logical_timeout_steps,
+            failure_reason_preset=args_cli.eval_failure_reason_preset,
+            failure_reasons=_parse_eval_failure_reason_override(args_cli.eval_failure_reasons),
             episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
             episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
             failure_frame_callback=lambda: _capture_eval_render_frame(env),
@@ -1244,6 +1274,8 @@ def _run_separate_motion_evaluation(
                 force_full_motion_from_start=args_cli.eval_full_motion,
                 failure_hold_steps=failure_hold_steps,
                 logical_timeout_steps=logical_timeout_steps,
+                failure_reason_preset=args_cli.eval_failure_reason_preset,
+                failure_reasons=_parse_eval_failure_reason_override(args_cli.eval_failure_reasons),
                 episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
                 episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
                 failure_frame_callback=lambda: _capture_eval_render_frame(env),
@@ -1315,6 +1347,8 @@ def _run_separate_motion_evaluation_reuse(
                 reset_env=True,
                 failure_hold_steps=failure_hold_steps,
                 logical_timeout_steps=logical_timeout_steps,
+                failure_reason_preset=args_cli.eval_failure_reason_preset,
+                failure_reasons=_parse_eval_failure_reason_override(args_cli.eval_failure_reasons),
                 episode_start_callback=video_renamer.start_episode if video_renamer is not None else None,
                 episode_callback=video_renamer.finish_episode if video_renamer is not None else None,
                 failure_frame_callback=lambda: _capture_eval_render_frame(env),
@@ -1474,6 +1508,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "eval_mode": resolved_eval_mode,
                 "eval_full_motion": args_cli.eval_full_motion,
                 "eval_single_episode_per_env": args_cli.eval_single_episode_per_env,
+                "eval_failure_reason_preset": args_cli.eval_failure_reason_preset,
+                "eval_failure_reasons": _parse_eval_failure_reason_override(args_cli.eval_failure_reasons),
                 "eval_failure_hold_seconds": EVAL_FAILURE_HOLD_SECONDS,
                 "eval_failure_hold_steps": int(failure_hold_steps),
                 "eval_logical_timeout_steps": logical_timeout_steps,

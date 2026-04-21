@@ -10,6 +10,7 @@
 import argparse
 import os
 from pathlib import Path
+import shutil
 import sys
 
 from isaaclab.app import AppLauncher
@@ -403,6 +404,49 @@ def _resolve_direct_checkpoint_path(path: str | None) -> str | None:
     return checkpoint_path
 
 
+def _maybe_create_resume_checkpoint_alias(
+    *,
+    log_dir: str,
+    resumed_training: bool,
+    start_iteration: int,
+    num_learning_iterations: int,
+    actual_final_iteration: int,
+) -> None:
+    """Create a compatibility alias for resumed runs whose final saved checkpoint is iteration-1.
+
+    RSL-RL's runner saves the final checkpoint using `current_learning_iteration`, which is set to the
+    last loop index. For resumed runs this means continuing from iteration `N` for `K` iterations ends
+    at `model_{N + K - 1}.pt` rather than the often-expected `model_{N + K}.pt`.
+    """
+
+    if not resumed_training or int(num_learning_iterations) <= 0:
+        return
+
+    expected_final_iteration = int(start_iteration) + int(num_learning_iterations)
+    actual_final_iteration = int(actual_final_iteration)
+    if actual_final_iteration != expected_final_iteration - 1:
+        return
+
+    log_dir_path = Path(log_dir)
+    actual_checkpoint_path = log_dir_path / f"model_{actual_final_iteration}.pt"
+    alias_checkpoint_path = log_dir_path / f"model_{expected_final_iteration}.pt"
+    if not actual_checkpoint_path.is_file() or alias_checkpoint_path.exists():
+        return
+
+    try:
+        os.link(actual_checkpoint_path, alias_checkpoint_path)
+        alias_kind = "hard link"
+    except OSError:
+        shutil.copy2(actual_checkpoint_path, alias_checkpoint_path)
+        alias_kind = "copy"
+
+    print(
+        "[INFO] Created resumed-training checkpoint alias "
+        f"({alias_kind}) to match inclusive iteration naming: "
+        f"{alias_checkpoint_path} -> {actual_checkpoint_path.name}"
+    )
+
+
 def _validate_ewc_configuration(
     *,
     er_motion_file: str | list[str] | None,
@@ -533,6 +577,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             f"ewc_actor_only={args_cli.ewc_actor_only}"
         )
 
+    resumed_training = bool(direct_resume_path is not None or agent_cfg.resume)
+    start_learning_iteration = int(getattr(runner, "current_learning_iteration", 0))
+
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
@@ -541,6 +588,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # run training
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    _maybe_create_resume_checkpoint_alias(
+        log_dir=log_dir,
+        resumed_training=resumed_training,
+        start_iteration=start_learning_iteration,
+        num_learning_iterations=int(agent_cfg.max_iterations),
+        actual_final_iteration=int(getattr(runner, "current_learning_iteration", 0)),
+    )
 
     # close the simulator
     env.close()

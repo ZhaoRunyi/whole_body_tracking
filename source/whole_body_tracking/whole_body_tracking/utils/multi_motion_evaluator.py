@@ -28,7 +28,15 @@ TIMEOUT_INFO_KEYS = ("time_outs", "time_out", "timeouts")
 JOINT_EFFORT_ATTR_KEYS = ("applied_torque", "computed_torque", "joint_torque", "joint_torques", "applied_joint_efforts")
 CONTACT_FORCE_ATTR_KEYS = ("net_forces_w", "net_forces_world", "net_forces_w_history")
 SUCCESS_REASON_KEYS = ("motion_end", "time_out")
-PRIMARY_TERMINATION_REASON_ORDER = ("motion_end", "time_out", "anchor_pos", "anchor_ori", "ee_body_pos", "terminated")
+CURRENT_FAILURE_REASON_KEYS = ("anchor_pos", "anchor_ori", "ee_body_pos")
+HOVER_FAILURE_REASON_KEYS = ("gravity", "undesired_contact", "reference_motion_distance")
+FAILURE_REASON_PRESETS = {
+    "current": CURRENT_FAILURE_REASON_KEYS,
+    "hover": HOVER_FAILURE_REASON_KEYS,
+    "all": CURRENT_FAILURE_REASON_KEYS + HOVER_FAILURE_REASON_KEYS,
+}
+SUPPORTED_FAILURE_REASON_KEYS = tuple(dict.fromkeys(CURRENT_FAILURE_REASON_KEYS + HOVER_FAILURE_REASON_KEYS))
+PRIMARY_TERMINATION_REASON_ORDER = ("motion_end", "time_out") + SUPPORTED_FAILURE_REASON_KEYS + ("terminated",)
 DEFAULT_EE_BODY_NAMES = (
     "left_ankle_roll_link",
     "right_ankle_roll_link",
@@ -119,6 +127,32 @@ def _get_body_indexes(motion_command, body_names: list[str] | tuple[str, ...] | 
     return [idx for idx, name in enumerate(motion_command.cfg.body_names) if name in selected]
 
 
+def _resolve_failure_reason_names(
+    preset: str = "current",
+    failure_reasons: list[str] | tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
+    if failure_reasons is None:
+        preset_key = str(preset or "current").strip().lower()
+        if preset_key not in FAILURE_REASON_PRESETS:
+            valid_presets = ", ".join(sorted(FAILURE_REASON_PRESETS))
+            raise ValueError(f"Unsupported failure reason preset '{preset}'. Valid presets: {valid_presets}")
+        return tuple(FAILURE_REASON_PRESETS[preset_key])
+
+    resolved: list[str] = []
+    for reason in failure_reasons:
+        reason_name = str(reason).strip()
+        if not reason_name:
+            continue
+        if reason_name not in SUPPORTED_FAILURE_REASON_KEYS:
+            valid_reasons = ", ".join(SUPPORTED_FAILURE_REASON_KEYS)
+            raise ValueError(f"Unsupported failure reason '{reason_name}'. Valid reasons: {valid_reasons}")
+        if reason_name not in resolved:
+            resolved.append(reason_name)
+    if not resolved:
+        raise ValueError("Resolved failure reason set is empty.")
+    return tuple(resolved)
+
+
 def _tensor_to_float_list(values: torch.Tensor) -> list[float]:
     return [float(v) for v in values.detach().cpu().reshape(-1).tolist()]
 
@@ -157,7 +191,65 @@ def _build_joint_diagnostics(robot, motion_command, env_id: int) -> dict[str, An
     }
 
 
-def _build_failure_details_for_env(base_env, motion_command, env_id: int, reason: str) -> dict[str, Any]:
+def _get_hover_threshold(base_env, attr_name: str, default: float) -> float:
+    cfg = getattr(base_env, "cfg", None)
+    value = getattr(cfg, attr_name, None) if cfg is not None else None
+    return float(default if value is None else value)
+
+
+def _get_latest_contact_forces(contact_sensor) -> torch.Tensor | None:
+    sensor_data = getattr(contact_sensor, "data", None)
+    if sensor_data is None:
+        return None
+
+    forces = None
+    for key in CONTACT_FORCE_ATTR_KEYS:
+        values = getattr(sensor_data, key, None)
+        if isinstance(values, torch.Tensor):
+            forces = values
+            break
+    if forces is None:
+        return None
+    if forces.ndim == 4:
+        forces = forces[:, -1]
+    if forces.ndim != 3:
+        return None
+    return forces
+
+
+def _resolve_undesired_contact_body_ids(base_env, contact_sensor) -> list[int]:
+    rewards_cfg = getattr(getattr(base_env, "cfg", None), "rewards", None)
+    undesired_contacts_cfg = getattr(rewards_cfg, "undesired_contacts", None) if rewards_cfg is not None else None
+    params = getattr(undesired_contacts_cfg, "params", None)
+    sensor_cfg = params.get("sensor_cfg") if isinstance(params, dict) else None
+    if sensor_cfg is None:
+        return []
+
+    body_ids = getattr(sensor_cfg, "body_ids", None)
+    if body_ids is not None:
+        resolved_ids = [int(body_id) for body_id in body_ids if int(body_id) >= 0]
+        if resolved_ids:
+            return resolved_ids
+
+    body_names = getattr(sensor_cfg, "body_names", None)
+    if body_names is None or contact_sensor is None or not hasattr(contact_sensor, "find_bodies"):
+        return []
+    try:
+        body_ids, _ = contact_sensor.find_bodies(body_names)
+    except Exception:
+        return []
+    return [int(body_id) for body_id in body_ids if int(body_id) >= 0]
+
+
+def _get_contact_body_names(base_env, contact_sensor) -> list[str]:
+    sensor_body_names = list(getattr(contact_sensor, "body_names", []) or [])
+    if sensor_body_names:
+        return sensor_body_names
+    robot = base_env.scene["robot"]
+    return list(getattr(robot, "body_names", []) or [])
+
+
+def _build_failure_details_for_env(base_env, motion_command, env_id: int, reason: str, contact_sensor=None) -> dict[str, Any]:
     robot = base_env.scene["robot"]
     details: dict[str, Any] = {
         "reason": reason,
@@ -235,11 +327,93 @@ def _build_failure_details_for_env(base_env, motion_command, env_id: int, reason
             "worst_link": worst_link,
             "links": links,
         }
+    elif reason == "gravity":
+        gravity_x_threshold = _get_hover_threshold(base_env, "gravity_x_threshold", 0.7)
+        gravity_y_threshold = _get_hover_threshold(base_env, "gravity_y_threshold", 0.7)
+        projected_gravity_b = robot.data.projected_gravity_b[env_id]
+        details["gravity"] = {
+            "gravity_x_threshold": gravity_x_threshold,
+            "gravity_y_threshold": gravity_y_threshold,
+            "actual_projected_gravity_b": _tensor_to_float_list(projected_gravity_b),
+            "abs_projected_gravity_xy": [
+                float(projected_gravity_b[0].abs().item()),
+                float(projected_gravity_b[1].abs().item()),
+            ],
+            "exceeds_x": bool(projected_gravity_b[0].abs().item() > gravity_x_threshold),
+            "exceeds_y": bool(projected_gravity_b[1].abs().item() > gravity_y_threshold),
+        }
+    elif reason == "undesired_contact":
+        contact_force_threshold = 1.0
+        latest_forces = _get_latest_contact_forces(contact_sensor)
+        undesired_body_ids = _resolve_undesired_contact_body_ids(base_env, contact_sensor)
+        contact_body_names = _get_contact_body_names(base_env, contact_sensor)
+        bodies = []
+        violated_bodies = []
+        worst_body = None
+        worst_force = -1.0
+        if latest_forces is not None and undesired_body_ids:
+            force_norms = torch.linalg.vector_norm(latest_forces[env_id, undesired_body_ids], dim=-1)
+            for local_idx, body_id in enumerate(undesired_body_ids):
+                body_name = contact_body_names[body_id] if body_id < len(contact_body_names) else f"body_{body_id}"
+                body_force = float(force_norms[local_idx].item())
+                violated = body_force > contact_force_threshold
+                body_row = {
+                    "body_name": body_name,
+                    "body_index": int(body_id),
+                    "contact_force_norm": body_force,
+                    "threshold": contact_force_threshold,
+                    "violated": violated,
+                }
+                bodies.append(body_row)
+                if violated:
+                    violated_bodies.append(body_name)
+                if body_force > worst_force:
+                    worst_force = body_force
+                    worst_body = body_row
+        details["undesired_contact"] = {
+            "threshold": contact_force_threshold,
+            "violated_bodies": violated_bodies,
+            "worst_body": worst_body,
+            "bodies": bodies,
+        }
+    elif reason == "reference_motion_distance":
+        threshold = _get_hover_threshold(base_env, "max_ref_motion_dist", 0.5)
+        body_distance = torch.linalg.vector_norm(motion_command.body_pos_relative_w[env_id] - motion_command.robot_body_pos_w[env_id], dim=-1)
+        body_rows = []
+        violated_bodies = []
+        worst_body = None
+        worst_distance = -1.0
+        for body_index, body_name in enumerate(motion_command.cfg.body_names):
+            distance = float(body_distance[body_index].item())
+            violated = distance > threshold
+            body_row = {
+                "body_name": body_name,
+                "body_index": int(body_index),
+                "distance": distance,
+                "threshold": threshold,
+                "violated": violated,
+                "ref_pos_w": _tensor_to_float_list(motion_command.body_pos_relative_w[env_id, body_index]),
+                "actual_pos_w": _tensor_to_float_list(motion_command.robot_body_pos_w[env_id, body_index]),
+            }
+            body_rows.append(body_row)
+            if violated:
+                violated_bodies.append(body_name)
+            if distance > worst_distance:
+                worst_distance = distance
+                worst_body = body_row
+        details["reference_motion_distance"] = {
+            "threshold": threshold,
+            "mean_distance": float(body_distance.mean().item()),
+            "max_distance": float(body_distance.max().item()),
+            "violated_bodies": violated_bodies,
+            "worst_body": worst_body,
+            "bodies": body_rows,
+        }
 
     return details
 
 
-def _compute_episode_reason_masks(base_env, motion_command, timeout_mask: torch.Tensor) -> dict[str, torch.Tensor]:
+def _compute_episode_reason_masks(base_env, motion_command, timeout_mask: torch.Tensor, contact_sensor=None) -> dict[str, torch.Tensor]:
     num_envs = int(motion_command.motion_ids.shape[0])
     device = motion_command.motion_ids.device
 
@@ -269,18 +443,52 @@ def _compute_episode_reason_masks(base_env, motion_command, timeout_mask: torch.
     else:
         ee_body_pos_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
+    gravity_x_threshold = _get_hover_threshold(base_env, "gravity_x_threshold", 0.7)
+    gravity_y_threshold = _get_hover_threshold(base_env, "gravity_y_threshold", 0.7)
+    projected_gravity_b = robot.data.projected_gravity_b
+    gravity_mask = (projected_gravity_b[:, 0].abs() > gravity_x_threshold) | (
+        projected_gravity_b[:, 1].abs() > gravity_y_threshold
+    )
+
+    contact_force_threshold = 1.0
+    latest_forces = _get_latest_contact_forces(contact_sensor)
+    undesired_body_ids = _resolve_undesired_contact_body_ids(base_env, contact_sensor)
+    if latest_forces is not None and undesired_body_ids:
+        undesired_force_norms = torch.linalg.vector_norm(latest_forces[:, undesired_body_ids], dim=-1)
+        undesired_contact_mask = torch.max(undesired_force_norms, dim=1).values > contact_force_threshold
+    else:
+        undesired_contact_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+    max_ref_motion_dist = _get_hover_threshold(base_env, "max_ref_motion_dist", 0.5)
+    reference_motion_distance = torch.linalg.vector_norm(
+        motion_command.body_pos_relative_w - motion_command.robot_body_pos_w, dim=-1
+    )
+    reference_motion_distance_mask = torch.any(reference_motion_distance > max_ref_motion_dist, dim=-1)
+
     return {
         "motion_end": motion_end_mask,
         "time_out": timeout_mask,
         "anchor_pos": anchor_pos_mask,
         "anchor_ori": anchor_ori_mask,
         "ee_body_pos": ee_body_pos_mask,
+        "gravity": gravity_mask,
+        "undesired_contact": undesired_contact_mask,
+        "reference_motion_distance": reference_motion_distance_mask,
     }
 
 
-def _select_reason_for_env(reason_masks: dict[str, torch.Tensor], env_id: int) -> str:
+def _select_reason_for_env(
+    reason_masks: dict[str, torch.Tensor],
+    env_id: int,
+    failure_reason_names: tuple[str, ...] | list[str] | None = None,
+) -> str:
     reason = "terminated"
-    for candidate in PRIMARY_TERMINATION_REASON_ORDER:
+    candidate_order = ("motion_end", "time_out")
+    if failure_reason_names is None:
+        candidate_order = candidate_order + SUPPORTED_FAILURE_REASON_KEYS
+    else:
+        candidate_order = candidate_order + tuple(failure_reason_names)
+    for candidate in candidate_order:
         if candidate == "terminated":
             continue
         candidate_mask = reason_masks.get(candidate)
@@ -291,13 +499,13 @@ def _select_reason_for_env(reason_masks: dict[str, torch.Tensor], env_id: int) -
 
 
 def _classify_episode_outcomes(
-    base_env, motion_command, timeout_mask: torch.Tensor, done_env_ids: torch.Tensor
+    base_env, motion_command, timeout_mask: torch.Tensor, done_env_ids: torch.Tensor, contact_sensor=None, failure_reason_names=None
 ) -> list[dict[str, Any]]:
-    reason_masks = _compute_episode_reason_masks(base_env, motion_command, timeout_mask)
+    reason_masks = _compute_episode_reason_masks(base_env, motion_command, timeout_mask, contact_sensor=contact_sensor)
     outcomes: list[dict[str, Any]] = []
     for env_id_tensor in done_env_ids:
         env_id = int(env_id_tensor.item())
-        reason = _select_reason_for_env(reason_masks, env_id)
+        reason = _select_reason_for_env(reason_masks, env_id, failure_reason_names=failure_reason_names)
         outcomes.append(
             {
                 "success": reason in SUCCESS_REASON_KEYS,
@@ -596,6 +804,8 @@ def evaluate_multi_motion_policy(
     reset_env: bool = True,
     failure_hold_steps: int = 0,
     logical_timeout_steps: int | None = None,
+    failure_reason_preset: str = "current",
+    failure_reasons: list[str] | tuple[str, ...] | None = None,
     episode_start_callback=None,
     episode_callback=None,
     failure_frame_callback=None,
@@ -607,6 +817,10 @@ def evaluate_multi_motion_policy(
     failure_hold_steps = max(int(failure_hold_steps), 0)
     if logical_timeout_steps is not None and logical_timeout_steps <= 0:
         logical_timeout_steps = None
+    active_failure_reasons = _resolve_failure_reason_names(
+        preset=failure_reason_preset,
+        failure_reasons=failure_reasons,
+    )
 
     base_env = getattr(env, "unwrapped", env)
     motion_command = base_env.command_manager.get_term("motion")
@@ -705,10 +919,10 @@ def evaluate_multi_motion_policy(
         else:
             logical_timeout_mask = episode_length >= int(logical_timeout_steps)
         timeout_mask = env_timeout_mask | logical_timeout_mask
-        reason_masks = _compute_episode_reason_masks(base_env, motion_command, timeout_mask)
+        reason_masks = _compute_episode_reason_masks(base_env, motion_command, timeout_mask, contact_sensor=contact_sensor)
 
         failure_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
-        for failure_reason in ("anchor_pos", "anchor_ori", "ee_body_pos"):
+        for failure_reason in active_failure_reasons:
             failure_mask |= reason_masks.get(failure_reason, torch.zeros_like(failure_mask))
         new_failure_mask = failure_mask & (~pending_failure)
         new_failure_env_ids = new_failure_mask.nonzero(as_tuple=False).flatten()
@@ -728,9 +942,13 @@ def evaluate_multi_motion_policy(
                 failure_metric_sums[metric_name][new_failure_env_ids] = metric_accumulator[new_failure_env_ids]
             for env_id_tensor in new_failure_env_ids:
                 env_id = int(env_id_tensor.item())
-                failure_reason = _select_reason_for_env(reason_masks, env_id)
+                failure_reason = _select_reason_for_env(
+                    reason_masks, env_id, failure_reason_names=active_failure_reasons
+                )
                 failure_reason_by_env[env_id] = failure_reason
-                failure_details_by_env[env_id] = _build_failure_details_for_env(base_env, motion_command, env_id, failure_reason)
+                failure_details_by_env[env_id] = _build_failure_details_for_env(
+                    base_env, motion_command, env_id, failure_reason, contact_sensor=contact_sensor
+                )
                 if captured_failure_frame is not None:
                     failure_frame_by_env[env_id] = np.asarray(captured_failure_frame).copy()
 
@@ -771,7 +989,9 @@ def evaluate_multi_motion_policy(
                     done_lengths.append(episode_steps)
                     video_lengths.append(episode_steps)
                     failure_detected_steps.append(None)
-                    reason = _select_reason_for_env(reason_masks, env_id)
+                    reason = _select_reason_for_env(
+                        reason_masks, env_id, failure_reason_names=active_failure_reasons
+                    )
                     done_outcomes.append(
                         {
                             "success": reason in SUCCESS_REASON_KEYS,
@@ -895,6 +1115,8 @@ def evaluate_multi_motion_policy(
         "pinned_motion_id": pinned_motion_id,
         "failure_hold_steps": int(failure_hold_steps),
         "logical_timeout_steps": logical_timeout_steps,
+        "failure_reason_preset": str(failure_reason_preset),
+        "failure_reasons": list(active_failure_reasons),
         "tracked_motion_ids": tracked_motion_ids,
         "motion_files": [os.path.abspath(all_motion_files[motion_id]) for motion_id in tracked_motion_ids],
         "completed_first_episode_env_count": int(completed_first_episode.sum().item()),
