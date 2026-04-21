@@ -227,7 +227,20 @@ def _resolve_undesired_contact_body_ids(base_env, contact_sensor) -> list[int]:
 
     body_ids = getattr(sensor_cfg, "body_ids", None)
     if body_ids is not None:
-        resolved_ids = [int(body_id) for body_id in body_ids if int(body_id) >= 0]
+        resolved_ids: list[int] | None
+        if isinstance(body_ids, slice):
+            resolved_ids = None
+        elif isinstance(body_ids, (int, np.integer)):
+            resolved_ids = [int(body_ids)] if int(body_ids) >= 0 else []
+        elif isinstance(body_ids, torch.Tensor):
+            resolved_ids = [int(body_id) for body_id in body_ids.reshape(-1).tolist() if int(body_id) >= 0]
+        elif isinstance(body_ids, np.ndarray):
+            resolved_ids = [int(body_id) for body_id in body_ids.reshape(-1).tolist() if int(body_id) >= 0]
+        else:
+            try:
+                resolved_ids = [int(body_id) for body_id in body_ids if int(body_id) >= 0]
+            except TypeError:
+                resolved_ids = None
         if resolved_ids:
             return resolved_ids
 
