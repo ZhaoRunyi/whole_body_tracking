@@ -109,6 +109,12 @@ parser.add_argument(
     help="Load a checkpoint directly from a local .pt path and continue training from it.",
 )
 parser.add_argument(
+    "--log_dir",
+    type=str,
+    default=None,
+    help="Optional explicit log directory. When provided, training artifacts are written into this directory instead of a new timestamped run folder.",
+)
+parser.add_argument(
     "--ewc_enable",
     action=argparse.BooleanOptionalAction,
     default=False,
@@ -404,6 +410,17 @@ def _resolve_direct_checkpoint_path(path: str | None) -> str | None:
     return checkpoint_path
 
 
+def _resolve_explicit_log_dir(path: str | None) -> str | None:
+    if path is None:
+        return None
+
+    log_dir_path = Path(path).expanduser().resolve()
+    if log_dir_path.exists() and not log_dir_path.is_dir():
+        raise ValueError(f"--log_dir must point to a directory path: {log_dir_path}")
+    log_dir_path.mkdir(parents=True, exist_ok=True)
+    return str(log_dir_path)
+
+
 def _maybe_create_resume_checkpoint_alias(
     *,
     log_dir: str,
@@ -500,6 +517,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     _apply_sampling_strategy(env_cfg, args_cli.sampling_strategy)
     _configure_training_visualization(env_cfg, args_cli.render_refpose)
     direct_resume_path = _resolve_direct_checkpoint_path(args_cli.local_ckpt)
+    explicit_log_dir = _resolve_explicit_log_dir(args_cli.log_dir)
     if direct_resume_path is not None and agent_cfg.resume:
         raise ValueError("Use either --local_ckpt or --resume/--load_run/--checkpoint, not both.")
     if args_cli.ewc_enable:
@@ -515,11 +533,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
-    # specify directory for logging runs: {time-stamp}_{run_name}
-    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    if agent_cfg.run_name:
-        log_dir += f"_{agent_cfg.run_name}"
-    log_dir = os.path.join(log_root_path, log_dir)
+    if explicit_log_dir is not None:
+        log_dir = explicit_log_dir
+        print(f"[INFO] Reusing explicit log directory: {log_dir}")
+    else:
+        # specify directory for logging runs: {time-stamp}_{run_name}
+        log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        if agent_cfg.run_name:
+            log_dir += f"_{agent_cfg.run_name}"
+        log_dir = os.path.join(log_root_path, log_dir)
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
