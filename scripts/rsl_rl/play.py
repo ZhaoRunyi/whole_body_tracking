@@ -17,6 +17,16 @@ from isaaclab.app import AppLauncher
 # local imports
 import cli_args  # isort: skip
 
+EVAL_FAILURE_REASON_PRESET_CHOICES = ("all", "current", "hover")
+EVAL_FAILURE_REASON_KEY_CHOICES = (
+    "anchor_pos",
+    "anchor_ori",
+    "ee_body_pos",
+    "gravity",
+    "undesired_contact",
+    "reference_motion_distance",
+)
+
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Play or evaluate an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during play or evaluation.")
@@ -127,7 +137,7 @@ parser.add_argument(
 parser.add_argument(
     "--eval_failure_reason_preset",
     type=str,
-    choices=tuple(sorted(FAILURE_REASON_PRESETS)),
+    choices=EVAL_FAILURE_REASON_PRESET_CHOICES,
     default="current",
     help="Preset failure reason set used by the evaluator.",
 )
@@ -137,7 +147,7 @@ parser.add_argument(
     default=None,
     help=(
         "Optional comma-separated failure reason override. "
-        f"Valid reasons: {', '.join(SUPPORTED_FAILURE_REASON_KEYS)}. "
+        f"Valid reasons: {', '.join(EVAL_FAILURE_REASON_KEY_CHOICES)}. "
         "When provided, this overrides --eval_failure_reason_preset."
     ),
 )
