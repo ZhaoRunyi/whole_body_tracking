@@ -1214,10 +1214,13 @@ def _print_evaluation_summary(result: dict) -> None:
         episode_return = row.get("mean_episode_return")
         anchor_err = row.get("mean_error_anchor_pos")
         body_err = row.get("mean_error_body_pos")
+        mpjpe_g = row.get("mean_mpjpe_global_mm")
+        mpjpe_l = row.get("mean_mpjpe_local_mm")
         print(
             f"[INFO]   {motion_name}: episodes={episodes}/{target_episodes}, "
             f"success_rate={success_rate}, return={episode_return}, "
-            f"anchor_pos_err={anchor_err}, body_pos_err={body_err}"
+            f"anchor_pos_err={anchor_err}, body_pos_err={body_err}, "
+            f"mpjpe_g_mm={mpjpe_g}, mpjpe_l_mm={mpjpe_l}"
         )
 
 
@@ -1554,6 +1557,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 "eval_failure_hold_steps": int(failure_hold_steps),
                 "eval_logical_timeout_steps": logical_timeout_steps,
                 "eval_artifact_dir": str(pathlib.Path(eval_artifact_dir).resolve()),
+                "mpjpe_body_names": list(env_cfg.commands.motion.body_names),
+                "mpjpe_anchor_body_name": str(env_cfg.commands.motion.anchor_body_name),
             }
         )
 

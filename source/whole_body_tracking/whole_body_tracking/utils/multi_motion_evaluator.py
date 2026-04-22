@@ -23,6 +23,10 @@ TRACKING_METRIC_KEYS = (
     "error_joint_pos",
     "error_joint_vel",
 )
+MPJPE_METRIC_KEYS = (
+    "mpjpe_global_mm",
+    "mpjpe_local_mm",
+)
 
 TIMEOUT_INFO_KEYS = ("time_outs", "time_out", "timeouts")
 JOINT_EFFORT_ATTR_KEYS = ("applied_torque", "computed_torque", "joint_torque", "joint_torques", "applied_joint_efforts")
@@ -727,6 +731,9 @@ def _collect_step_metrics(
         if isinstance(value, torch.Tensor):
             metrics[key] = value
 
+    mpjpe_metrics = _compute_mpjpe_metrics(motion_command)
+    metrics.update(mpjpe_metrics)
+
     metrics["action_l2"] = _per_env_l2_norm(actions)
     if previous_actions is None:
         metrics["action_rate_l2"] = torch.zeros(actions.shape[0], device=actions.device)
@@ -742,6 +749,30 @@ def _collect_step_metrics(
         metrics["mean_contact_force"] = contact_force_metric
 
     return metrics
+
+
+def _compute_mpjpe_metrics(motion_command) -> dict[str, torch.Tensor]:
+    ref_body_pos = motion_command.body_pos_relative_w
+    actual_body_pos = motion_command.robot_body_pos_w
+
+    global_mpjpe_mm = torch.linalg.vector_norm(actual_body_pos - ref_body_pos, dim=-1).mean(dim=-1) * 1000.0
+
+    anchor_body_index = int(getattr(motion_command, "motion_anchor_body_index", 0))
+    anchor_body_index = max(min(anchor_body_index, ref_body_pos.shape[1] - 1), 0)
+    ref_anchor_pos = ref_body_pos[:, anchor_body_index : anchor_body_index + 1]
+    actual_anchor_pos = actual_body_pos[:, anchor_body_index : anchor_body_index + 1]
+    local_mpjpe_mm = (
+        torch.linalg.vector_norm(
+            (actual_body_pos - actual_anchor_pos) - (ref_body_pos - ref_anchor_pos),
+            dim=-1,
+        ).mean(dim=-1)
+        * 1000.0
+    )
+
+    return {
+        "mpjpe_global_mm": global_mpjpe_mm,
+        "mpjpe_local_mm": local_mpjpe_mm,
+    }
 
 
 class _MotionEpisodeAggregator:
@@ -1101,6 +1132,8 @@ def evaluate_multi_motion_policy(
                     "episode_length_ratio": episode_length_ratio,
                     "video_length_steps": int(video_lengths[local_idx]),
                 }
+                for metric_name, metric_value in sorted(metric_means_by_env[local_idx].items()):
+                    episode_row[f"mean_{metric_name}"] = float(metric_value)
                 if failure_detected_steps[local_idx] is not None:
                     episode_row["failure_detected_step"] = int(failure_detected_steps[local_idx])
                     episode_row["failure_hold_steps"] = int(video_lengths[local_idx] - done_lengths[local_idx])
@@ -1183,6 +1216,9 @@ def evaluate_multi_motion_policy(
         "tracked_motion_ids": tracked_motion_ids,
         "motion_files": [os.path.abspath(all_motion_files[motion_id]) for motion_id in tracked_motion_ids],
         "completed_first_episode_env_count": int(completed_first_episode.sum().item()),
+        "mpjpe_metric_names": list(MPJPE_METRIC_KEYS),
+        "mpjpe_body_names": list(motion_command.cfg.body_names),
+        "mpjpe_anchor_body_name": str(motion_command.cfg.anchor_body_name),
     }
     if original_motion_prob is not None:
         motion_command.motion_prob = original_motion_prob
